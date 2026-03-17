@@ -152,12 +152,9 @@ def webhook():
         return ''
     else:
         abort(403)
-
+        
 # --- ЗАПУСК СЕРВЕРА ---
 if __name__ == '__main__':
-    bot.remove_webhook()
-    bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
-    print(f"Вебхук установлен на {WEBHOOK_URL}/{TOKEN}")
-    
+    # Убрали запросы к Telegram, чтобы сервер стартовал моментально
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
