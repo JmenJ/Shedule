@@ -95,14 +95,6 @@ class BotHandlers:
             or self.repository.get_role(group_id, user_id) == "owner"
         )
 
-    def is_telegram_admin(self, group_id: int, user_id: int) -> bool:
-        try:
-            member = self.bot.get_chat_member(group_id, user_id)
-            return member.status in {"creator", "administrator"}
-        except telebot.apihelper.ApiTelegramException:
-            LOGGER.exception("Не удалось проверить права Telegram-администратора")
-            return False
-
     def schedule_keyboard(
         self, group_id: int, user_id: int, show_settings: bool = False
     ) -> types.InlineKeyboardMarkup:
@@ -175,7 +167,7 @@ class BotHandlers:
             else:
                 self.bot.send_message(
                     message.chat.id,
-                    "Добавьте меня в учебную группу. Администратор группы сможет подключить её командой /setup КОД.",
+                    "Добавьте меня в учебную группу. Участник с одноразовым кодом сможет подключить её командой /setup КОД и станет владельцем настроек.",
                 )
             return
 
@@ -183,7 +175,7 @@ class BotHandlers:
         if group is None:
             self.bot.reply_to(
                 message,
-                "Эта группа ещё не подключена. Администратор группы должен использовать /setup КОД.",
+                "Эта группа ещё не подключена. Участник с одноразовым кодом должен использовать /setup КОД и станет владельцем её настроек.",
             )
             return
 
@@ -209,8 +201,8 @@ class BotHandlers:
                     "Как подключить новую учебную группу:\n"
                     "1. Откройте /admin.\n"
                     "2. Создайте одноразовый код подключения.\n"
-                    "3. Передайте код администратору Telegram-группы.\n"
-                    "4. Администратор добавляет бота в группу и отправляет там /setup КОД.\n\n"
+                    "3. Передайте код будущему владельцу расписания.\n"
+                    "4. После добавления бота этот человек отправляет в группе /setup КОД.\n\n"
                     "После подключения расписание и права настраиваются командой /settings внутри нужной группы.\n"
                     "Ваш Telegram ID можно посмотреть командой /myid.",
                     reply_markup=self.admin_keyboard(),
@@ -220,25 +212,20 @@ class BotHandlers:
                     message.chat.id,
                     "📚 Этот бот показывает расписание отдельно для каждой учебной группы.\n\n"
                     "Добавьте бота в нужную Telegram-группу или откройте уже подключённую группу и отправьте там /help. "
-                    "Для первого подключения администратору группы понадобится одноразовый код от владельца бота.",
+                    "Если у вас есть одноразовый код, отправьте в новой группе /setup КОД — вы станете владельцем её настроек.",
                 )
             return
 
         group = self.repository.get_group(message.chat.id)
         if group is None:
-            if self.is_telegram_admin(message.chat.id, user_id):
-                text = (
-                    "🛠 Эта группа ещё не подключена.\n\n"
-                    "Вы администратор группы, поэтому можете настроить бота:\n"
-                    "1. Получите одноразовый код у владельца бота.\n"
-                    "2. Отправьте здесь /setup КОД.\n"
-                    "3. После подключения откройте /settings и заполните расписание."
-                )
-            else:
-                text = (
-                    "Эта группа ещё не подключена к расписанию. "
-                    "Попросите администратора группы получить код у владельца бота и выполнить /setup КОД."
-                )
+            text = (
+                "🛠 Эта группа ещё не подключена.\n\n"
+                "Если у вас есть одноразовый код от владельца бота:\n"
+                "1. Отправьте здесь /setup КОД.\n"
+                "2. Вы станете владельцем настроек этой группы.\n"
+                "3. Откройте /settings и заполните расписание.\n\n"
+                "Статус администратора Telegram для этого не требуется."
+            )
             self.bot.reply_to(message, text)
             return
 
@@ -311,12 +298,6 @@ class BotHandlers:
         if message.chat.type not in GROUP_CHAT_TYPES:
             self.bot.reply_to(
                 message, "Команда /setup используется внутри Telegram-группы."
-            )
-            return
-        if not self.is_telegram_admin(message.chat.id, message.from_user.id):
-            self.bot.reply_to(
-                message,
-                "Подключить бота может только администратор этой Telegram-группы.",
             )
             return
 
@@ -576,7 +557,7 @@ class BotHandlers:
             text = (
                 f"Код подключения: {code}\n\n"
                 f"Действует {self.settings.setup_code_ttl_hours} ч. и используется один раз.\n"
-                "Передайте его администратору группы. После добавления бота он должен выполнить в группе:\n\n"
+                "Передайте его будущему владельцу расписания. После добавления бота он должен выполнить в группе:\n\n"
                 f"/setup {code}"
             )
             self.safe_edit(call, text, self.back_button("adm:home"))

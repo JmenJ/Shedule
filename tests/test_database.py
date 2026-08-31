@@ -39,6 +39,27 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.repository.get_role(-1001, 100), "owner")
         self.assertIsNone(self.repository.get_role(-1002, 100))
 
+    def test_new_code_cannot_take_over_an_existing_group(self):
+        first_code = self.repository.create_setup_code(100, "blank", 24)
+        self.assertTrue(self.connect_group(-1001, first_code).ok)
+        second_code = self.repository.create_setup_code(100, "blank", 24)
+
+        result = self.repository.consume_setup_code(
+            code=second_code,
+            group_id=-1001,
+            group_title="Та же группа",
+            user_id=200,
+            display_name="Другой участник",
+            timezone="Europe/Moscow",
+            anchor_monday=date(2026, 8, 31),
+            anchor_week_type="upper",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.message, "Эта группа уже настроена.")
+        self.assertEqual(self.repository.get_role(-1001, 100), "owner")
+        self.assertIsNone(self.repository.get_role(-1001, 200))
+
     def test_schedule_entries_do_not_leak_between_groups(self):
         for group_id in (-1001, -1002):
             code = self.repository.create_setup_code(100, "blank", 24)
