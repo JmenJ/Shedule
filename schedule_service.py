@@ -64,17 +64,48 @@ def format_schedule(
     repository: Repository,
     group: Group,
     target_date: date,
+    subgroup_id: int | None = None,
 ) -> str:
     day_of_week = target_date.weekday()
     week_type = week_type_for_date(group, target_date)
-    entries = repository.list_schedule(group.chat_id, week_type, day_of_week)
+    common_entries = repository.list_schedule(
+        group.chat_id, week_type, day_of_week, subgroup_id=None
+    )
+    subgroup = None
+    subgroup_entries = []
+    if subgroup_id is not None:
+        subgroup = repository.get_subgroup(group.chat_id, subgroup_id)
+        if subgroup is not None:
+            subgroup_entries = repository.list_schedule(
+                group.chat_id, week_type, day_of_week, subgroup_id=subgroup.id
+            )
+    entries = sorted(
+        [*common_entries, *subgroup_entries],
+        key=lambda entry: (entry.position, entry.id),
+    )
     header = f"📅 {DAYS_RU[day_of_week]} ({WEEK_LABELS[week_type]} неделя):"
+    if subgroup is not None:
+        header += f"\n👤 {subgroup.name}"
     body = (
         "\n\n".join(entry.text for entry in entries)
         if entries
         else group.empty_day_text
     )
     return f"{header}\n\n{body}"
+
+
+def notification_messages(
+    repository: Repository,
+    group: Group,
+    target_date: date,
+) -> list[str]:
+    subgroups = repository.list_subgroups(group.chat_id)
+    if not subgroups:
+        return [f"🌅 Доброе утро!\n\n{format_schedule(repository, group, target_date)}"]
+    return [
+        f"🌅 Доброе утро!\n\n{format_schedule(repository, group, target_date, subgroup.id)}"
+        for subgroup in subgroups
+    ]
 
 
 def current_week_type(group: Group, now: datetime | None = None) -> str:

@@ -22,6 +22,7 @@ from sqlalchemy import (
     func,
     select,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -65,11 +66,24 @@ class GroupModerator(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
+class Subgroup(Base):
+    __tablename__ = "subgroups"
+    __table_args__ = (UniqueConstraint("group_id", "name", name="uq_subgroup_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("groups.chat_id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(80))
+    position: Mapped[int] = mapped_column(Integer)
+
+
 class ScheduleEntry(Base):
     __tablename__ = "schedule_entries"
     __table_args__ = (
         UniqueConstraint(
             "group_id",
+            "subgroup_id",
             "week_type",
             "day_of_week",
             "position",
@@ -81,10 +95,46 @@ class ScheduleEntry(Base):
     group_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("groups.chat_id", ondelete="CASCADE"), index=True
     )
+    subgroup_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("subgroups.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     week_type: Mapped[str] = mapped_column(String(5), index=True)
     day_of_week: Mapped[int] = mapped_column(Integer, index=True)
     position: Mapped[int] = mapped_column(Integer)
     text: Mapped[str] = mapped_column(Text)
+
+
+class UserSubgroupPreference(Base):
+    __tablename__ = "user_subgroup_preferences"
+
+    group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("groups.chat_id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    subgroup_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subgroups.id", ondelete="CASCADE")
+    )
+
+
+class GroupNotification(Base):
+    __tablename__ = "group_notifications"
+
+    group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("groups.chat_id", ondelete="CASCADE"), primary_key=True
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    notification_time: Mapped[str] = mapped_column(String(5), default="07:30")
+
+
+class NotificationDelivery(Base):
+    __tablename__ = "notification_deliveries"
+
+    group_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    local_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    sent_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
 class SetupCode(Base):
@@ -233,6 +283,13 @@ class Repository:
                     added_by=user_id,
                 )
             )
+            session.add(
+                GroupNotification(
+                    group_id=group_id,
+                    enabled=False,
+                    notification_time="07:30",
+                )
+            )
             setup_code.used_at = utc_now()
             setup_code.used_by = user_id
             setup_code.used_group_id = group_id
@@ -311,8 +368,224 @@ class Repository:
             session.delete(row)
             return True
 
+    def transfer_ownership(
+        self,
+        group_id: int,
+        target_user_id: int,
+        target_display_name: str,
+        changed_by: int,
+    ) -> bool:
+        with self.Session.begin() as session:
+            current_owner = session.scalar(
+                select(GroupModerator).where(
+                    GroupModerator.group_id == group_id,
+                    GroupModerator.role == "owner",
+                )
+            )
+            if current_owner is None or current_owner.user_id == target_user_id:
+                return False
+
+            target = session.get(GroupModerator, (group_id, target_user_id))
+            if target is None:
+                target = GroupModerator(
+                    group_id=group_id,
+                    user_id=target_user_id,
+                    role="owner",
+                    display_name=target_display_name[:255],
+                    added_by=changed_by,
+                )
+                session.add(target)
+            else:
+                target.role = "owner"
+                target.display_name = target_display_name[:255]
+
+            current_owner.role = "moderator"
+            group = session.get(Group, group_id)
+            if group is not None:
+                group.created_by = target_user_id
+            return True
+
+    def list_subgroups(self, group_id: int) -> list[Subgroup]:
+        with self.Session() as session:
+            return list(
+                session.scalars(
+                    select(Subgroup)
+                    .where(Subgroup.group_id == group_id)
+                    .order_by(Subgroup.position, Subgroup.id)
+                )
+            )
+
+    def get_subgroup(self, group_id: int, subgroup_id: int) -> Subgroup | None:
+        with self.Session() as session:
+            return session.scalar(
+                select(Subgroup).where(
+                    Subgroup.id == subgroup_id, Subgroup.group_id == group_id
+                )
+            )
+
+    def add_subgroup(self, group_id: int, name: str) -> Subgroup:
+        with self.Session.begin() as session:
+            max_position = session.scalar(
+                select(func.max(Subgroup.position)).where(Subgroup.group_id == group_id)
+            )
+            subgroup = Subgroup(
+                group_id=group_id,
+                name=name,
+                position=(max_position or 0) + 1,
+            )
+            session.add(subgroup)
+            return subgroup
+
+    def rename_subgroup(self, group_id: int, subgroup_id: int, name: str) -> bool:
+        with self.Session.begin() as session:
+            subgroup = session.scalar(
+                select(Subgroup).where(
+                    Subgroup.id == subgroup_id, Subgroup.group_id == group_id
+                )
+            )
+            if subgroup is None:
+                return False
+            subgroup.name = name
+            return True
+
+    def delete_subgroup(self, group_id: int, subgroup_id: int) -> bool:
+        with self.Session.begin() as session:
+            subgroup = session.scalar(
+                select(Subgroup).where(
+                    Subgroup.id == subgroup_id, Subgroup.group_id == group_id
+                )
+            )
+            if subgroup is None:
+                return False
+            session.execute(
+                delete(UserSubgroupPreference).where(
+                    UserSubgroupPreference.group_id == group_id,
+                    UserSubgroupPreference.subgroup_id == subgroup_id,
+                )
+            )
+            session.execute(
+                delete(ScheduleEntry).where(
+                    ScheduleEntry.group_id == group_id,
+                    ScheduleEntry.subgroup_id == subgroup_id,
+                )
+            )
+            session.delete(subgroup)
+            return True
+
+    def set_user_subgroup(self, group_id: int, user_id: int, subgroup_id: int) -> bool:
+        with self.Session.begin() as session:
+            subgroup = session.scalar(
+                select(Subgroup).where(
+                    Subgroup.id == subgroup_id, Subgroup.group_id == group_id
+                )
+            )
+            if subgroup is None:
+                return False
+            preference = session.get(UserSubgroupPreference, (group_id, user_id))
+            if preference is None:
+                session.add(
+                    UserSubgroupPreference(
+                        group_id=group_id,
+                        user_id=user_id,
+                        subgroup_id=subgroup_id,
+                    )
+                )
+            else:
+                preference.subgroup_id = subgroup_id
+            return True
+
+    def get_user_subgroup(self, group_id: int, user_id: int) -> Subgroup | None:
+        with self.Session() as session:
+            return session.scalar(
+                select(Subgroup)
+                .join(
+                    UserSubgroupPreference,
+                    UserSubgroupPreference.subgroup_id == Subgroup.id,
+                )
+                .where(
+                    UserSubgroupPreference.group_id == group_id,
+                    UserSubgroupPreference.user_id == user_id,
+                    Subgroup.group_id == group_id,
+                )
+            )
+
+    def clear_user_subgroup(self, group_id: int, user_id: int) -> None:
+        with self.Session.begin() as session:
+            preference = session.get(UserSubgroupPreference, (group_id, user_id))
+            if preference is not None:
+                session.delete(preference)
+
+    def get_notification_settings(self, group_id: int) -> GroupNotification:
+        with self.Session.begin() as session:
+            notification = session.get(GroupNotification, group_id)
+            if notification is None:
+                notification = GroupNotification(
+                    group_id=group_id,
+                    enabled=False,
+                    notification_time="07:30",
+                )
+                session.add(notification)
+            return notification
+
+    def update_notification_settings(
+        self,
+        group_id: int,
+        *,
+        enabled: bool | None = None,
+        notification_time: str | None = None,
+    ) -> GroupNotification:
+        with self.Session.begin() as session:
+            notification = session.get(GroupNotification, group_id)
+            if notification is None:
+                notification = GroupNotification(
+                    group_id=group_id,
+                    enabled=False,
+                    notification_time="07:30",
+                )
+                session.add(notification)
+            if enabled is not None:
+                notification.enabled = enabled
+            if notification_time is not None:
+                notification.notification_time = notification_time
+            return notification
+
+    def list_enabled_notifications(self) -> list[tuple[Group, GroupNotification]]:
+        with self.Session() as session:
+            return list(
+                session.execute(
+                    select(Group, GroupNotification)
+                    .join(
+                        GroupNotification, GroupNotification.group_id == Group.chat_id
+                    )
+                    .where(Group.active.is_(True), GroupNotification.enabled.is_(True))
+                ).all()
+            )
+
+    def claim_notification(self, group_id: int, local_date: date) -> bool:
+        try:
+            with self.Session.begin() as session:
+                session.add(
+                    NotificationDelivery(group_id=group_id, local_date=local_date)
+                )
+            return True
+        except IntegrityError:
+            return False
+
+    def release_notification(self, group_id: int, local_date: date) -> None:
+        with self.Session.begin() as session:
+            session.execute(
+                delete(NotificationDelivery).where(
+                    NotificationDelivery.group_id == group_id,
+                    NotificationDelivery.local_date == local_date,
+                )
+            )
+
     def list_schedule(
-        self, group_id: int, week_type: str, day_of_week: int
+        self,
+        group_id: int,
+        week_type: str,
+        day_of_week: int,
+        subgroup_id: int | None = None,
     ) -> list[ScheduleEntry]:
         with self.Session() as session:
             return list(
@@ -320,6 +593,9 @@ class Repository:
                     select(ScheduleEntry)
                     .where(
                         ScheduleEntry.group_id == group_id,
+                        ScheduleEntry.subgroup_id.is_(None)
+                        if subgroup_id is None
+                        else ScheduleEntry.subgroup_id == subgroup_id,
                         ScheduleEntry.week_type == week_type,
                         ScheduleEntry.day_of_week == day_of_week,
                     )
@@ -336,24 +612,94 @@ class Repository:
             )
 
     def add_schedule_entry(
-        self, group_id: int, week_type: str, day_of_week: int, text: str
+        self,
+        group_id: int,
+        week_type: str,
+        day_of_week: int,
+        text: str,
+        subgroup_id: int | None = None,
     ) -> ScheduleEntry:
         with self.Session.begin() as session:
+            if subgroup_id is not None:
+                subgroup = session.scalar(
+                    select(Subgroup).where(
+                        Subgroup.id == subgroup_id, Subgroup.group_id == group_id
+                    )
+                )
+                if subgroup is None:
+                    raise ValueError("Подгруппа не найдена")
             max_position = session.scalar(
                 select(func.max(ScheduleEntry.position)).where(
                     ScheduleEntry.group_id == group_id,
+                    ScheduleEntry.subgroup_id.is_(None)
+                    if subgroup_id is None
+                    else ScheduleEntry.subgroup_id == subgroup_id,
                     ScheduleEntry.week_type == week_type,
                     ScheduleEntry.day_of_week == day_of_week,
                 )
             )
             entry = ScheduleEntry(
                 group_id=group_id,
+                subgroup_id=subgroup_id,
                 week_type=week_type,
                 day_of_week=day_of_week,
                 position=(max_position or 0) + 1,
                 text=text,
             )
             session.add(entry)
+            return entry
+
+    def move_schedule_entry(
+        self, group_id: int, entry_id: int, direction: str
+    ) -> ScheduleEntry | None:
+        if direction not in {"up", "down"}:
+            raise ValueError("Неизвестное направление")
+        with self.Session.begin() as session:
+            entry = session.scalar(
+                select(ScheduleEntry).where(
+                    ScheduleEntry.id == entry_id, ScheduleEntry.group_id == group_id
+                )
+            )
+            if entry is None:
+                return None
+
+            scope_filter = (
+                ScheduleEntry.subgroup_id.is_(None)
+                if entry.subgroup_id is None
+                else ScheduleEntry.subgroup_id == entry.subgroup_id
+            )
+            position_filter = (
+                ScheduleEntry.position < entry.position
+                if direction == "up"
+                else ScheduleEntry.position > entry.position
+            )
+            order = (
+                ScheduleEntry.position.desc()
+                if direction == "up"
+                else ScheduleEntry.position.asc()
+            )
+            neighbour = session.scalar(
+                select(ScheduleEntry)
+                .where(
+                    ScheduleEntry.group_id == group_id,
+                    scope_filter,
+                    ScheduleEntry.week_type == entry.week_type,
+                    ScheduleEntry.day_of_week == entry.day_of_week,
+                    position_filter,
+                )
+                .order_by(order)
+                .limit(1)
+            )
+            if neighbour is None:
+                return entry
+
+            entry_position = entry.position
+            neighbour_position = neighbour.position
+            entry.position = -(entry.id + 1)
+            session.flush()
+            neighbour.position = entry_position
+            session.flush()
+            entry.position = neighbour_position
             return entry
 
     def update_schedule_entry(self, group_id: int, entry_id: int, text: str) -> bool:

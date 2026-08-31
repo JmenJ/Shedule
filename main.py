@@ -11,6 +11,7 @@ from telebot import types
 from config import Settings
 from database import Repository
 from handlers import BotHandlers
+from notifications import NotificationDispatcher
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -25,6 +26,7 @@ repository.create_schema()
 bot = telebot.TeleBot(settings.bot_token, threaded=True)
 handlers = BotHandlers(bot, repository, settings)
 handlers.register()
+notification_dispatcher = NotificationDispatcher(bot, repository)
 
 app = Flask(__name__)
 
@@ -75,8 +77,12 @@ def configure_telegram() -> None:
 
 if __name__ == "__main__":
     configure_telegram()
-    if settings.webhook_url:
-        port = int(os.environ.get("PORT", "10000"))
-        app.run(host="0.0.0.0", port=port, threaded=True)
-    else:
-        bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    notification_dispatcher.start()
+    try:
+        if settings.webhook_url:
+            port = int(os.environ.get("PORT", "10000"))
+            app.run(host="0.0.0.0", port=port, threaded=True)
+        else:
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    finally:
+        notification_dispatcher.shutdown()

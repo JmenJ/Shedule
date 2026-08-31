@@ -5,7 +5,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from database import Repository
-from schedule_service import format_schedule, target_date_for_action, week_type_for_date
+from schedule_service import (
+    format_schedule,
+    notification_messages,
+    target_date_for_action,
+    week_type_for_date,
+)
 
 
 class ScheduleServiceTests(unittest.TestCase):
@@ -50,6 +55,37 @@ class ScheduleServiceTests(unittest.TestCase):
         text = format_schedule(self.repository, self.group, date(2026, 8, 31))
         self.assertIn("Верхняя неделя", text)
         self.assertIn("Математика", text)
+
+    def test_subgroup_schedule_includes_common_and_personal_entries(self):
+        subgroup = self.repository.add_subgroup(-1001, "Подгруппа 1")
+        self.repository.add_schedule_entry(-1001, "upper", 0, "Общая лекция")
+        self.repository.add_schedule_entry(
+            -1001, "upper", 0, "Лабораторная", subgroup_id=subgroup.id
+        )
+
+        text = format_schedule(
+            self.repository, self.group, date(2026, 8, 31), subgroup.id
+        )
+
+        self.assertIn("Подгруппа 1", text)
+        self.assertIn("Общая лекция", text)
+        self.assertIn("Лабораторная", text)
+
+    def test_notifications_build_one_message_per_subgroup(self):
+        first = self.repository.add_subgroup(-1001, "Подгруппа 1")
+        second = self.repository.add_subgroup(-1001, "Подгруппа 2")
+        self.repository.add_schedule_entry(
+            -1001, "upper", 0, "Лабораторная 1", subgroup_id=first.id
+        )
+        self.repository.add_schedule_entry(
+            -1001, "upper", 0, "Лабораторная 2", subgroup_id=second.id
+        )
+
+        messages = notification_messages(self.repository, self.group, date(2026, 8, 31))
+
+        self.assertEqual(len(messages), 2)
+        self.assertIn("Подгруппа 1", messages[0])
+        self.assertIn("Подгруппа 2", messages[1])
 
 
 if __name__ == "__main__":

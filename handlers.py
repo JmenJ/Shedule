@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -101,8 +102,9 @@ class BotHandlers:
             LOGGER.exception("Не удалось проверить права Telegram-администратора")
             return False
 
-    @staticmethod
-    def schedule_keyboard(show_settings: bool = False) -> types.InlineKeyboardMarkup:
+    def schedule_keyboard(
+        self, group_id: int, user_id: int, show_settings: bool = False
+    ) -> types.InlineKeyboardMarkup:
         markup = types.InlineKeyboardMarkup()
         markup.row(
             types.InlineKeyboardButton("Сегодня", callback_data="view:today"),
@@ -120,6 +122,17 @@ class BotHandlers:
                 for index, label in enumerate(SHORT_DAYS_RU[4:], start=4)
             ]
         )
+        subgroups = self.repository.list_subgroups(group_id)
+        if subgroups:
+            selected = self.repository.get_user_subgroup(group_id, user_id)
+            label = (
+                f"👤 {truncate(selected.name, 28)}"
+                if selected is not None
+                else "👤 Выбрать подгруппу"
+            )
+            markup.row(
+                types.InlineKeyboardButton(label, callback_data="view:subgroups")
+            )
         if show_settings:
             markup.row(
                 types.InlineKeyboardButton(
@@ -177,7 +190,9 @@ class BotHandlers:
             message.chat.id,
             group.welcome_text,
             reply_markup=self.schedule_keyboard(
-                self.can_manage_group(message.chat.id, message.from_user.id)
+                message.chat.id,
+                message.from_user.id,
+                self.can_manage_group(message.chat.id, message.from_user.id),
             ),
         )
 
@@ -289,6 +304,12 @@ class BotHandlers:
             types.InlineKeyboardButton("✏️ Название", callback_data="cfg:title"),
             types.InlineKeyboardButton("💬 Тексты", callback_data="cfg:texts"),
         )
+        markup.row(
+            types.InlineKeyboardButton(
+                "🌅 Утренняя рассылка", callback_data="cfg:notify"
+            ),
+            types.InlineKeyboardButton("👥 Подгруппы", callback_data="cfg:subs"),
+        )
         markup.row(types.InlineKeyboardButton("🛡 Модераторы", callback_data="cfg:mods"))
         markup.row(
             types.InlineKeyboardButton("🗓 Открыть расписание", callback_data="cfg:show")
@@ -297,10 +318,18 @@ class BotHandlers:
 
     def settings_text(self, group: Group) -> str:
         week_type = current_week_type(group)
+        notification = self.repository.get_notification_settings(group.chat_id)
+        notification_text = (
+            f"включена, {notification.notification_time}"
+            if notification.enabled
+            else "выключена"
+        )
         return (
             f"⚙️ Настройки «{group.title}»\n\n"
             f"Часовой пояс: {group.timezone}\n"
             f"Текущая неделя: {WEEK_LABELS[week_type]}\n\n"
+            f"Утренняя рассылка: {notification_text}\n"
+            f"Подгрупп: {len(self.repository.list_subgroups(group.chat_id))}\n\n"
             "Расписание и права относятся только к этой группе."
         )
 
@@ -360,15 +389,62 @@ class BotHandlers:
             raise CallbackNotice("Группа ещё не подключена.")
 
         raw_action = call.data.removeprefix("view:")
+        if raw_action == "subgroups":
+            self.show_view_subgroups(call, group)
+            return
+        if raw_action.startswith("sub:"):
+            subgroup_value = raw_action.split(":", maxsplit=1)[1]
+            if subgroup_value == "common":
+                self.repository.clear_user_subgroup(group.chat_id, call.from_user.id)
+            elif not self.repository.set_user_subgroup(
+                group.chat_id, call.from_user.id, int(subgroup_value)
+            ):
+                raise CallbackNotice("Подгруппа уже удалена.")
+            raw_action = "today"
+
         target_date = target_date_for_action(group, raw_action)
-        text = format_schedule(self.repository, group, target_date)
+        selected = self.repository.get_user_subgroup(group.chat_id, call.from_user.id)
+        text = format_schedule(
+            self.repository,
+            group,
+            target_date,
+            selected.id if selected is not None else None,
+        )
+        if selected is None and self.repository.list_subgroups(group.chat_id):
+            text += (
+                "\n\nℹ️ Сейчас показаны только общие занятия. Выберите свою подгруппу."
+            )
         self.safe_edit(
             call,
             text,
             self.schedule_keyboard(
-                self.can_manage_group(group.chat_id, call.from_user.id)
+                group.chat_id,
+                call.from_user.id,
+                self.can_manage_group(group.chat_id, call.from_user.id),
             ),
         )
+
+    def show_view_subgroups(self, call: types.CallbackQuery, group: Group) -> None:
+        subgroups = self.repository.list_subgroups(group.chat_id)
+        if not subgroups:
+            raise CallbackNotice("В этой группе подгруппы не настроены.")
+        selected = self.repository.get_user_subgroup(group.chat_id, call.from_user.id)
+        markup = types.InlineKeyboardMarkup()
+        for subgroup in subgroups:
+            prefix = "✅ " if selected and selected.id == subgroup.id else ""
+            markup.row(
+                types.InlineKeyboardButton(
+                    f"{prefix}{truncate(subgroup.name, 32)}",
+                    callback_data=f"view:sub:{subgroup.id}",
+                )
+            )
+        markup.row(
+            types.InlineKeyboardButton(
+                "Только общие занятия", callback_data="view:sub:common"
+            )
+        )
+        markup.row(types.InlineKeyboardButton("← Назад", callback_data="view:today"))
+        self.safe_edit(call, "Выберите свою подгруппу:", markup)
 
     def handle_admin_callback(self, call: types.CallbackQuery) -> None:
         if call.message.chat.type != "private" or not self.is_global_owner(
@@ -454,28 +530,29 @@ class BotHandlers:
                 call,
                 group.welcome_text,
                 self.schedule_keyboard(
-                    self.can_manage_group(group_id, call.from_user.id)
+                    group_id,
+                    call.from_user.id,
+                    self.can_manage_group(group_id, call.from_user.id),
                 ),
             )
         elif action == "schedule":
-            markup = types.InlineKeyboardMarkup()
-            markup.row(
-                types.InlineKeyboardButton("Верхняя", callback_data="cfg:week:upper"),
-                types.InlineKeyboardButton("Нижняя", callback_data="cfg:week:lower"),
-            )
-            markup.row(
-                types.InlineKeyboardButton("← Настройки", callback_data="cfg:home")
-            )
-            self.safe_edit(call, "Выберите неделю для редактирования:", markup)
-        elif action == "week" and len(parts) == 3:
-            self.show_week_editor(call, parts[2])
-        elif action == "day" and len(parts) == 4:
-            self.show_day_editor(call, parts[2], int(parts[3]))
-        elif action == "add" and len(parts) == 4:
+            self.show_schedule_scopes(call)
+        elif action == "scope" and len(parts) == 3:
+            self.show_scope_weeks(call, parts[2])
+        elif action == "week" and len(parts) == 4:
+            self.show_week_editor(call, parts[2], parts[3])
+        elif action == "day" and len(parts) == 5:
+            self.show_day_editor(call, parts[2], parts[3], int(parts[4]))
+        elif action == "add" and len(parts) == 5:
+            subgroup_id = self.subgroup_id_from_token(group_id, parts[2])
             self.begin_text_input(
                 call,
                 "add_entry",
-                {"week_type": parts[2], "day_of_week": int(parts[3])},
+                {
+                    "subgroup_id": subgroup_id,
+                    "week_type": parts[3],
+                    "day_of_week": int(parts[4]),
+                },
                 "Ответьте на это сообщение текстом занятия. Формат свободный, например:\n"
                 "1. Математика, ауд. 204, 08:00–09:30\n\nОтмена: /cancel",
             )
@@ -500,7 +577,10 @@ class BotHandlers:
                 ),
                 types.InlineKeyboardButton(
                     "Отмена",
-                    callback_data=f"cfg:day:{entry.week_type}:{entry.day_of_week}",
+                    callback_data=(
+                        f"cfg:day:{self.scope_token(entry.subgroup_id)}:"
+                        f"{entry.week_type}:{entry.day_of_week}"
+                    ),
                 ),
             )
             self.safe_edit(call, f"Удалить это занятие?\n\n{entry.text}", markup)
@@ -509,8 +589,23 @@ class BotHandlers:
             if entry is None:
                 raise CallbackNotice("Занятие уже удалено.")
             week_type, day_of_week = entry.week_type, entry.day_of_week
+            subgroup_id = entry.subgroup_id
             self.repository.delete_schedule_entry(group_id, entry.id)
-            self.show_day_editor(call, week_type, day_of_week)
+            self.show_day_editor(
+                call, self.scope_token(subgroup_id), week_type, day_of_week
+            )
+        elif action == "move" and len(parts) == 4:
+            entry = self.repository.move_schedule_entry(
+                group_id, int(parts[2]), parts[3]
+            )
+            if entry is None:
+                raise CallbackNotice("Занятие уже удалено.")
+            self.show_day_editor(
+                call,
+                self.scope_token(entry.subgroup_id),
+                entry.week_type,
+                entry.day_of_week,
+            )
         elif action == "anchor":
             markup = types.InlineKeyboardMarkup()
             markup.row(
@@ -588,6 +683,45 @@ class BotHandlers:
                 {},
                 "Ответьте на это сообщение текстом для дня без занятий (до 500 символов).\n\nОтмена: /cancel",
             )
+        elif action == "notify":
+            self.show_notification_settings(call)
+        elif action == "notoggle":
+            notification = self.repository.get_notification_settings(group_id)
+            self.repository.update_notification_settings(
+                group_id, enabled=not notification.enabled
+            )
+            self.show_notification_settings(call)
+        elif action == "nottime":
+            self.begin_text_input(
+                call,
+                "notification_time",
+                {},
+                "Ответьте на это сообщение временем утренней рассылки в формате ЧЧ:ММ, например 07:30. Используется часовой пояс группы.\n\nОтмена: /cancel",
+            )
+        elif action == "subs":
+            self.show_subgroups_settings(call)
+        elif action == "subadd":
+            self.begin_text_input(
+                call,
+                "subgroup_add",
+                {},
+                "Ответьте на это сообщение названием новой подгруппы (до 40 символов).\n\nОтмена: /cancel",
+            )
+        elif action == "subedit" and len(parts) == 3:
+            subgroup = self.repository.get_subgroup(group_id, int(parts[2]))
+            if subgroup is None:
+                raise CallbackNotice("Подгруппа уже удалена.")
+            self.begin_text_input(
+                call,
+                "subgroup_rename",
+                {"subgroup_id": subgroup.id},
+                f"Ответьте новым названием для «{subgroup.name}» (до 40 символов).\n\nОтмена: /cancel",
+            )
+        elif action == "subdelask" and len(parts) == 3:
+            self.confirm_delete_subgroup(call, int(parts[2]))
+        elif action == "subdel" and len(parts) == 3:
+            self.repository.delete_subgroup(group_id, int(parts[2]))
+            self.show_subgroups_settings(call)
         elif action == "mods":
             self.show_moderators(call)
         elif action == "modpick":
@@ -601,31 +735,113 @@ class BotHandlers:
                 raise CallbackNotice("Только владелец группы может менять роли.")
             self.repository.remove_moderator(group_id, int(parts[2]))
             self.show_moderators(call)
+        elif action == "ownerpick":
+            self.show_owner_candidates(call)
+        elif action == "ownerask" and len(parts) == 3:
+            self.confirm_transfer_owner(call, int(parts[2]))
+        elif action == "owner" and len(parts) == 3:
+            self.transfer_owner_from_callback(call, int(parts[2]))
 
-    def show_week_editor(self, call: types.CallbackQuery, week_type: str) -> None:
+    @staticmethod
+    def scope_token(subgroup_id: int | None) -> str:
+        return "common" if subgroup_id is None else str(subgroup_id)
+
+    def subgroup_id_from_token(self, group_id: int, scope_token: str) -> int | None:
+        if scope_token == "common":
+            return None
+        subgroup_id = int(scope_token)
+        if self.repository.get_subgroup(group_id, subgroup_id) is None:
+            raise CallbackNotice("Подгруппа уже удалена.")
+        return subgroup_id
+
+    def scope_label(self, group_id: int, scope_token: str) -> str:
+        subgroup_id = self.subgroup_id_from_token(group_id, scope_token)
+        if subgroup_id is None:
+            return "Общее для всех"
+        subgroup = self.repository.get_subgroup(group_id, subgroup_id)
+        return subgroup.name if subgroup is not None else "Подгруппа"
+
+    def show_schedule_scopes(self, call: types.CallbackQuery) -> None:
+        group_id = call.message.chat.id
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton(
+                "Общее для всех", callback_data="cfg:scope:common"
+            )
+        )
+        for subgroup in self.repository.list_subgroups(group_id):
+            markup.row(
+                types.InlineKeyboardButton(
+                    f"👤 {truncate(subgroup.name, 32)}",
+                    callback_data=f"cfg:scope:{subgroup.id}",
+                )
+            )
+        markup.row(types.InlineKeyboardButton("← Настройки", callback_data="cfg:home"))
+        self.safe_edit(
+            call,
+            "Какое расписание редактировать? Общие занятия показываются всем, занятия подгруппы — только выбравшим её участникам.",
+            markup,
+        )
+
+    def show_scope_weeks(self, call: types.CallbackQuery, scope_token: str) -> None:
+        group_id = call.message.chat.id
+        label = self.scope_label(group_id, scope_token)
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton(
+                "Верхняя", callback_data=f"cfg:week:{scope_token}:upper"
+            ),
+            types.InlineKeyboardButton(
+                "Нижняя", callback_data=f"cfg:week:{scope_token}:lower"
+            ),
+        )
+        markup.row(
+            types.InlineKeyboardButton("← Расписания", callback_data="cfg:schedule")
+        )
+        self.safe_edit(call, f"{label}. Выберите неделю:", markup)
+
+    def show_week_editor(
+        self, call: types.CallbackQuery, scope_token: str, week_type: str
+    ) -> None:
         if week_type not in WEEK_LABELS:
             raise ValueError("Неизвестный тип недели")
+        self.subgroup_id_from_token(call.message.chat.id, scope_token)
         markup = types.InlineKeyboardMarkup()
         for start in (0, 3, 6):
             buttons = [
                 types.InlineKeyboardButton(
-                    SHORT_DAYS_RU[index], callback_data=f"cfg:day:{week_type}:{index}"
+                    SHORT_DAYS_RU[index],
+                    callback_data=f"cfg:day:{scope_token}:{week_type}:{index}",
                 )
                 for index in range(start, min(start + 3, 7))
             ]
             markup.row(*buttons)
         markup.row(
-            types.InlineKeyboardButton("← Выбор недели", callback_data="cfg:schedule")
+            types.InlineKeyboardButton(
+                "← Выбор недели", callback_data=f"cfg:scope:{scope_token}"
+            )
         )
         self.safe_edit(call, f"{WEEK_LABELS[week_type]} неделя. Выберите день:", markup)
 
     def day_editor_content(
-        self, group_id: int, week_type: str, day_of_week: int
+        self,
+        group_id: int,
+        scope_token: str,
+        week_type: str,
+        day_of_week: int,
     ) -> tuple[str, types.InlineKeyboardMarkup]:
         if week_type not in WEEK_LABELS or day_of_week not in range(7):
             raise ValueError("Некорректная неделя или день")
-        entries = self.repository.list_schedule(group_id, week_type, day_of_week)
-        lines = [f"{DAYS_RU[day_of_week]}, {WEEK_LABELS[week_type].lower()} неделя:"]
+        subgroup_id = self.subgroup_id_from_token(group_id, scope_token)
+        entries = self.repository.list_schedule(
+            group_id, week_type, day_of_week, subgroup_id=subgroup_id
+        )
+        lines = [
+            (
+                f"{self.scope_label(group_id, scope_token)}\n"
+                f"{DAYS_RU[day_of_week]}, {WEEK_LABELS[week_type].lower()} неделя:"
+            )
+        ]
         lines.extend(
             f"{index}. {entry.text}" for index, entry in enumerate(entries, start=1)
         )
@@ -639,26 +855,36 @@ class BotHandlers:
                     f"✏️ {index}. {truncate(entry.text)}",
                     callback_data=f"cfg:edit:{entry.id}",
                 ),
+                types.InlineKeyboardButton(
+                    "↑", callback_data=f"cfg:move:{entry.id}:up"
+                ),
+                types.InlineKeyboardButton(
+                    "↓", callback_data=f"cfg:move:{entry.id}:down"
+                ),
                 types.InlineKeyboardButton("🗑", callback_data=f"cfg:delask:{entry.id}"),
             )
         markup.row(
             types.InlineKeyboardButton(
                 "➕ Добавить занятие",
-                callback_data=f"cfg:add:{week_type}:{day_of_week}",
+                callback_data=f"cfg:add:{scope_token}:{week_type}:{day_of_week}",
             )
         )
         markup.row(
             types.InlineKeyboardButton(
-                "← Дни недели", callback_data=f"cfg:week:{week_type}"
+                "← Дни недели", callback_data=f"cfg:week:{scope_token}:{week_type}"
             )
         )
         return "\n\n".join(lines), markup
 
     def show_day_editor(
-        self, call: types.CallbackQuery, week_type: str, day_of_week: int
+        self,
+        call: types.CallbackQuery,
+        scope_token: str,
+        week_type: str,
+        day_of_week: int,
     ) -> None:
         text, markup = self.day_editor_content(
-            call.message.chat.id, week_type, day_of_week
+            call.message.chat.id, scope_token, week_type, day_of_week
         )
         self.safe_edit(call, text, markup)
 
@@ -712,6 +938,7 @@ class BotHandlers:
                     message.chat.id,
                     state.payload["week_type"],
                     int(state.payload["day_of_week"]),
+                    subgroup_id=state.payload.get("subgroup_id"),
                 )
                 if len(current_entries) >= 12:
                     raise ValueError(
@@ -722,6 +949,7 @@ class BotHandlers:
                     state.payload["week_type"],
                     int(state.payload["day_of_week"]),
                     value,
+                    subgroup_id=state.payload.get("subgroup_id"),
                 )
                 result_text = "Занятие добавлено ✅"
             elif state.action == "edit_entry":
@@ -753,6 +981,42 @@ class BotHandlers:
                     raise ValueError("Текст должен быть не длиннее 500 символов.")
                 self.repository.update_group(message.chat.id, **{state.action: value})
                 result_text = "Текст обновлён ✅"
+            elif state.action == "notification_time":
+                if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                    raise ValueError(
+                        "Время должно быть в формате ЧЧ:ММ, например 07:30."
+                    )
+                self.repository.update_notification_settings(
+                    message.chat.id, notification_time=value
+                )
+                result_text = "Время утренней рассылки обновлено ✅"
+            elif state.action == "subgroup_add":
+                if len(value) > 40:
+                    raise ValueError("Название должно быть не длиннее 40 символов.")
+                subgroups = self.repository.list_subgroups(message.chat.id)
+                if len(subgroups) >= 8:
+                    raise ValueError(
+                        "В одной группе можно создать не больше 8 подгрупп."
+                    )
+                if any(item.name.casefold() == value.casefold() for item in subgroups):
+                    raise ValueError("Подгруппа с таким названием уже существует.")
+                self.repository.add_subgroup(message.chat.id, value)
+                result_text = "Подгруппа добавлена ✅"
+            elif state.action == "subgroup_rename":
+                if len(value) > 40:
+                    raise ValueError("Название должно быть не длиннее 40 символов.")
+                subgroup_id = int(state.payload["subgroup_id"])
+                subgroups = self.repository.list_subgroups(message.chat.id)
+                if any(
+                    item.id != subgroup_id and item.name.casefold() == value.casefold()
+                    for item in subgroups
+                ):
+                    raise ValueError("Подгруппа с таким названием уже существует.")
+                if not self.repository.rename_subgroup(
+                    message.chat.id, subgroup_id, value
+                ):
+                    raise ValueError("Подгруппа уже удалена.")
+                result_text = "Подгруппа переименована ✅"
             else:
                 raise ValueError("Это действие уже не поддерживается.")
         except ValueError as exc:
@@ -763,6 +1027,81 @@ class BotHandlers:
 
         self.repository.clear_state(message.chat.id, message.from_user.id)
         self.bot.reply_to(message, result_text, reply_markup=self.settings_keyboard())
+
+    def show_notification_settings(self, call: types.CallbackQuery) -> None:
+        group = self.repository.get_group(call.message.chat.id)
+        if group is None:
+            raise CallbackNotice("Группа не настроена.")
+        notification = self.repository.get_notification_settings(group.chat_id)
+        status = "включена ✅" if notification.enabled else "выключена"
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton(
+                "Выключить" if notification.enabled else "Включить",
+                callback_data="cfg:notoggle",
+            ),
+            types.InlineKeyboardButton("Изменить время", callback_data="cfg:nottime"),
+        )
+        markup.row(types.InlineKeyboardButton("← Настройки", callback_data="cfg:home"))
+        self.safe_edit(
+            call,
+            f"🌅 Утренняя рассылка {status}.\n\n"
+            f"Время: {notification.notification_time}\n"
+            f"Часовой пояс: {group.timezone}\n\n"
+            "Если настроены подгруппы, бот отправит отдельное сообщение для каждой подгруппы.",
+            markup,
+        )
+
+    def show_subgroups_settings(self, call: types.CallbackQuery) -> None:
+        group_id = call.message.chat.id
+        subgroups = self.repository.list_subgroups(group_id)
+        lines = ["👥 Подгруппы этой группы:"]
+        lines.extend(f"• {subgroup.name}" for subgroup in subgroups)
+        if not subgroups:
+            lines.append("Подгрупп пока нет. Расписание считается общим.")
+        lines.append(
+            "\nОбщие занятия показываются всем. Для каждой подгруппы можно добавить собственные занятия."
+        )
+
+        markup = types.InlineKeyboardMarkup()
+        for subgroup in subgroups:
+            markup.row(
+                types.InlineKeyboardButton(
+                    f"✏️ {truncate(subgroup.name, 26)}",
+                    callback_data=f"cfg:subedit:{subgroup.id}",
+                ),
+                types.InlineKeyboardButton(
+                    "🗑", callback_data=f"cfg:subdelask:{subgroup.id}"
+                ),
+            )
+        if len(subgroups) < 8:
+            markup.row(
+                types.InlineKeyboardButton(
+                    "➕ Добавить подгруппу", callback_data="cfg:subadd"
+                )
+            )
+        markup.row(types.InlineKeyboardButton("← Настройки", callback_data="cfg:home"))
+        self.safe_edit(call, "\n".join(lines), markup)
+
+    def confirm_delete_subgroup(
+        self, call: types.CallbackQuery, subgroup_id: int
+    ) -> None:
+        subgroup = self.repository.get_subgroup(call.message.chat.id, subgroup_id)
+        if subgroup is None:
+            raise CallbackNotice("Подгруппа уже удалена.")
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton(
+                "Удалить вместе с расписанием",
+                callback_data=f"cfg:subdel:{subgroup.id}",
+            ),
+            types.InlineKeyboardButton("Отмена", callback_data="cfg:subs"),
+        )
+        self.safe_edit(
+            call,
+            f"Удалить подгруппу «{subgroup.name}»? Её отдельное расписание и выбор пользователей будут удалены.",
+            markup,
+        )
 
     def moderators_text(self, group_id: int) -> str:
         moderators = self.repository.list_moderators(group_id)
@@ -793,6 +1132,11 @@ class BotHandlers:
                             callback_data=f"cfg:modrmask:{moderator.user_id}",
                         )
                     )
+            markup.row(
+                types.InlineKeyboardButton(
+                    "👑 Передать владение", callback_data="cfg:ownerpick"
+                )
+            )
         markup.row(types.InlineKeyboardButton("← Настройки", callback_data="cfg:home"))
         return markup
 
@@ -869,6 +1213,92 @@ class BotHandlers:
         )
         self.safe_edit(
             call, f"Снять роль модератора с {moderator.display_name}?", markup
+        )
+
+    def show_owner_candidates(self, call: types.CallbackQuery) -> None:
+        group_id = call.message.chat.id
+        if not self.can_manage_moderators(group_id, call.from_user.id):
+            raise CallbackNotice("Только владелец группы может передать владение.")
+
+        current_owner = next(
+            (
+                item
+                for item in self.repository.list_moderators(group_id)
+                if item.role == "owner"
+            ),
+            None,
+        )
+        candidates: dict[int, str] = {
+            item.user_id: item.display_name
+            for item in self.repository.list_moderators(group_id)
+            if item.role != "owner"
+        }
+        for member in self.bot.get_chat_administrators(group_id):
+            if member.user.is_bot:
+                continue
+            if current_owner and member.user.id == current_owner.user_id:
+                continue
+            candidates[member.user.id] = display_name(member.user)
+
+        markup = types.InlineKeyboardMarkup()
+        for user_id, name in list(candidates.items())[:30]:
+            markup.row(
+                types.InlineKeyboardButton(
+                    f"👑 {truncate(name, 30)}",
+                    callback_data=f"cfg:ownerask:{user_id}",
+                )
+            )
+        markup.row(types.InlineKeyboardButton("← Модераторы", callback_data="cfg:mods"))
+        text = (
+            "Кому передать владение настройками группы? Текущий владелец станет модератором."
+            if candidates
+            else "Сначала добавьте будущего владельца как модератора."
+        )
+        self.safe_edit(call, text, markup)
+
+    def confirm_transfer_owner(
+        self, call: types.CallbackQuery, target_user_id: int
+    ) -> None:
+        group_id = call.message.chat.id
+        if not self.can_manage_moderators(group_id, call.from_user.id):
+            raise CallbackNotice("Только владелец группы может передать владение.")
+        member = self.bot.get_chat_member(group_id, target_user_id)
+        if member.user.is_bot or member.status in {"left", "kicked"}:
+            raise CallbackNotice("Пользователь больше не состоит в группе.")
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton(
+                "Передать владение",
+                callback_data=f"cfg:owner:{target_user_id}",
+            ),
+            types.InlineKeyboardButton("Отмена", callback_data="cfg:mods"),
+        )
+        self.safe_edit(
+            call,
+            f"Передать владение пользователю {display_name(member.user)}? Вы останетесь модератором.",
+            markup,
+        )
+
+    def transfer_owner_from_callback(
+        self, call: types.CallbackQuery, target_user_id: int
+    ) -> None:
+        group_id = call.message.chat.id
+        if not self.can_manage_moderators(group_id, call.from_user.id):
+            raise CallbackNotice("Только владелец группы может передать владение.")
+        member = self.bot.get_chat_member(group_id, target_user_id)
+        if member.user.is_bot or member.status in {"left", "kicked"}:
+            raise CallbackNotice("Пользователь больше не состоит в группе.")
+        if not self.repository.transfer_ownership(
+            group_id,
+            target_user_id,
+            display_name(member.user),
+            call.from_user.id,
+        ):
+            raise CallbackNotice("Не удалось передать владение.")
+        self.safe_edit(
+            call,
+            f"Владение передано пользователю {display_name(member.user)} ✅",
+            self.back_button("cfg:mods"),
         )
 
     def list_moderators_command(self, message: types.Message) -> None:
