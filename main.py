@@ -55,6 +55,7 @@ def webhook():
 def configure_telegram() -> None:
     commands = [
         types.BotCommand("start", "открыть расписание"),
+        types.BotCommand("help", "помощь с учётом ваших прав"),
         types.BotCommand("myid", "показать мой Telegram ID"),
         types.BotCommand("settings", "настройки этой группы"),
         types.BotCommand("mods", "редакторы этой группы"),

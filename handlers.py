@@ -54,6 +54,7 @@ class BotHandlers:
 
     def register(self) -> None:
         self.bot.register_message_handler(self.start, commands=["start", "schedule"])
+        self.bot.register_message_handler(self.help_command, commands=["help"])
         self.bot.register_message_handler(self.my_id, commands=["myid", "id"])
         self.bot.register_message_handler(self.admin, commands=["admin"])
         self.bot.register_message_handler(self.setup_group, commands=["setup"])
@@ -193,6 +194,99 @@ class BotHandlers:
                 message.chat.id,
                 message.from_user.id,
                 self.can_manage_group(message.chat.id, message.from_user.id),
+            ),
+        )
+
+    def help_command(self, message: types.Message) -> None:
+        """Show instructions tailored to the current chat and the user's role."""
+        user_id = message.from_user.id
+
+        if message.chat.type == "private":
+            if self.is_global_owner(user_id):
+                self.bot.send_message(
+                    message.chat.id,
+                    "👑 Вы владелец бота.\n\n"
+                    "Как подключить новую учебную группу:\n"
+                    "1. Откройте /admin.\n"
+                    "2. Создайте одноразовый код подключения.\n"
+                    "3. Передайте код администратору Telegram-группы.\n"
+                    "4. Администратор добавляет бота в группу и отправляет там /setup КОД.\n\n"
+                    "После подключения расписание и права настраиваются командой /settings внутри нужной группы.\n"
+                    "Ваш Telegram ID можно посмотреть командой /myid.",
+                    reply_markup=self.admin_keyboard(),
+                )
+            else:
+                self.bot.send_message(
+                    message.chat.id,
+                    "📚 Этот бот показывает расписание отдельно для каждой учебной группы.\n\n"
+                    "Добавьте бота в нужную Telegram-группу или откройте уже подключённую группу и отправьте там /help. "
+                    "Для первого подключения администратору группы понадобится одноразовый код от владельца бота.",
+                )
+            return
+
+        group = self.repository.get_group(message.chat.id)
+        if group is None:
+            if self.is_telegram_admin(message.chat.id, user_id):
+                text = (
+                    "🛠 Эта группа ещё не подключена.\n\n"
+                    "Вы администратор группы, поэтому можете настроить бота:\n"
+                    "1. Получите одноразовый код у владельца бота.\n"
+                    "2. Отправьте здесь /setup КОД.\n"
+                    "3. После подключения откройте /settings и заполните расписание."
+                )
+            else:
+                text = (
+                    "Эта группа ещё не подключена к расписанию. "
+                    "Попросите администратора группы получить код у владельца бота и выполнить /setup КОД."
+                )
+            self.bot.reply_to(message, text)
+            return
+
+        role = self.repository.get_role(message.chat.id, user_id)
+        lines = [
+            f"📚 Помощь по расписанию «{group.title}»",
+            "",
+            "Для просмотра:",
+            "• /start — открыть расписание;",
+            "• кнопки «Сегодня», «Завтра» и дни недели — выбрать день;",
+            "• «Выбрать подгруппу» — один раз указать свою подгруппу; выбор запомнится только для этой группы;",
+            "• /myid — показать ваш Telegram ID.",
+        ]
+
+        if self.can_manage_group(message.chat.id, user_id):
+            role_label = "модератор расписания"
+            if role == "owner":
+                role_label = "владелец настроек группы"
+            elif self.is_global_owner(user_id):
+                role_label = "владелец бота"
+            lines.extend(
+                [
+                    "",
+                    f"⚙️ Ваша роль: {role_label}.",
+                    "• /settings — расписание, подгруппы, тексты, часовой пояс, недели и утренняя рассылка;",
+                    "• при редактировании дня кнопки ↑ и ↓ меняют порядок занятий;",
+                    "• /cancel — отменить текущий ввод.",
+                ]
+            )
+
+        if self.can_manage_moderators(message.chat.id, user_id):
+            lines.extend(
+                [
+                    "",
+                    "👥 Управление доступом:",
+                    "• /mods — список владельца и модераторов;",
+                    "• ответьте на сообщение человека командой /mod_add или /mod_remove;",
+                    "• передача владения находится в /settings → «Модераторы».",
+                ]
+            )
+
+        self.bot.send_message(
+            message.chat.id,
+            "\n".join(lines),
+            reply_markup=self.schedule_keyboard(
+                message.chat.id,
+                user_id,
+                self.can_manage_group(message.chat.id, user_id),
             ),
         )
 
