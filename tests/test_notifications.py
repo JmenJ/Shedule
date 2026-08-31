@@ -61,6 +61,21 @@ class NotificationDispatcherTests(unittest.TestCase):
 
         self.assertEqual(self.bot.messages, [])
 
+    def test_shared_schedule_is_sent_to_every_linked_chat(self):
+        copy_code = self.repository.create_group_copy_code(-1001, 1, 24)
+        result = self.repository.consume_group_copy_code(
+            copy_code, -1002, "Второй чат", 2
+        )
+        self.assertTrue(result.ok)
+        now = datetime(2026, 9, 1, 4, 31, tzinfo=UTC)
+
+        self.dispatcher.run_once(now)
+        self.dispatcher.run_once(now)
+
+        self.assertEqual({chat_id for chat_id, _ in self.bot.messages}, {-1001, -1002})
+        self.assertEqual(len(self.bot.messages), 2)
+        self.assertTrue(all("Математика" in text for _, text in self.bot.messages))
+
 
 if __name__ == "__main__":
     unittest.main()

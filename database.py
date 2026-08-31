@@ -62,6 +62,19 @@ class Group(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class GroupLink(Base):
+    __tablename__ = "group_links"
+
+    chat_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("groups.chat_id", ondelete="CASCADE"), primary_key=True
+    )
+    source_group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("groups.chat_id", ondelete="CASCADE"), index=True
+    )
+    linked_by: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+
+
 class GroupModerator(Base):
     __tablename__ = "group_moderators"
 
@@ -160,6 +173,22 @@ class SetupCode(Base):
     used_group_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
+class GroupCopyCode(Base):
+    __tablename__ = "group_copy_codes"
+
+    code_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code_hint: Mapped[str] = mapped_column(String(8))
+    source_group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("groups.chat_id", ondelete="CASCADE"), index=True
+    )
+    created_by: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    used_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    used_group_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
 class ConversationState(Base):
     __tablename__ = "conversation_states"
 
@@ -214,6 +243,38 @@ class Repository:
                     entry.text = normalized
                     changed += 1
         return changed
+
+    @staticmethod
+    def _workspace_id(session, group_id: int) -> int:
+        link = session.get(GroupLink, group_id)
+        return link.source_group_id if link is not None else group_id
+
+    def resolve_group_id(self, group_id: int) -> int:
+        with self.Session() as session:
+            return self._workspace_id(session, group_id)
+
+    def _group_view(self, session, chat_id: int) -> Group | None:
+        physical_group = session.get(Group, chat_id)
+        if physical_group is None:
+            return None
+        workspace_id = self._workspace_id(session, chat_id)
+        if workspace_id == chat_id:
+            return physical_group
+        source = session.get(Group, workspace_id)
+        if source is None:
+            return physical_group
+        return Group(
+            chat_id=chat_id,
+            title=source.title,
+            timezone=source.timezone,
+            anchor_monday=source.anchor_monday,
+            anchor_week_type=source.anchor_week_type,
+            welcome_text=source.welcome_text,
+            empty_day_text=source.empty_day_text,
+            created_by=source.created_by,
+            created_at=physical_group.created_at,
+            active=physical_group.active,
+        )
 
     @staticmethod
     def _hash_code(code: str) -> str:
@@ -317,15 +378,120 @@ class Repository:
                 True, "Группа успешно подключена.", setup_code.template_key
             )
 
+    def create_group_copy_code(
+        self, group_id: int, created_by: int, ttl_hours: int
+    ) -> str:
+        with self.Session() as session:
+            source_group_id = self._workspace_id(session, group_id)
+            if session.get(Group, source_group_id) is None:
+                raise ValueError("Группа не настроена")
+
+        for _ in range(10):
+            code = "".join(secrets.choice(self.CODE_ALPHABET) for _ in range(10))
+            code_hash = self._hash_code(code)
+            with self.Session.begin() as session:
+                if session.get(GroupCopyCode, code_hash) is not None:
+                    continue
+                session.add(
+                    GroupCopyCode(
+                        code_hash=code_hash,
+                        code_hint=f"••••{code[-4:]}",
+                        source_group_id=source_group_id,
+                        created_by=created_by,
+                        expires_at=utc_now() + timedelta(hours=ttl_hours),
+                    )
+                )
+            return code
+        raise RuntimeError("Не удалось сгенерировать уникальный код")
+
+    def consume_group_copy_code(
+        self,
+        code: str,
+        target_group_id: int,
+        target_group_title: str,
+        used_by: int,
+    ) -> CodeUseResult:
+        code_hash = self._hash_code(code)
+        with self.Session.begin() as session:
+            copy_code = session.scalar(
+                select(GroupCopyCode)
+                .where(GroupCopyCode.code_hash == code_hash)
+                .with_for_update()
+            )
+            if copy_code is None:
+                return CodeUseResult(False, "Код объединения не найден.")
+            if copy_code.used_at is not None:
+                return CodeUseResult(False, "Этот код объединения уже использован.")
+            if copy_code.expires_at <= utc_now():
+                return CodeUseResult(False, "Срок действия кода объединения истёк.")
+            if session.get(Group, target_group_id) is not None:
+                return CodeUseResult(
+                    False,
+                    "Эта группа уже настроена. Объединить можно только новую группу.",
+                )
+
+            source_group_id = self._workspace_id(session, copy_code.source_group_id)
+            source = session.get(Group, source_group_id)
+            if source is None or not source.active:
+                return CodeUseResult(False, "Исходная группа больше не активна.")
+
+            session.add(
+                Group(
+                    chat_id=target_group_id,
+                    title=target_group_title[:255],
+                    timezone=source.timezone,
+                    anchor_monday=source.anchor_monday,
+                    anchor_week_type=source.anchor_week_type,
+                    welcome_text=source.welcome_text,
+                    empty_day_text=source.empty_day_text,
+                    created_by=source.created_by,
+                )
+            )
+            session.add(
+                GroupLink(
+                    chat_id=target_group_id,
+                    source_group_id=source_group_id,
+                    linked_by=used_by,
+                )
+            )
+            copy_code.used_at = utc_now()
+            copy_code.used_by = used_by
+            copy_code.used_group_id = target_group_id
+            return CodeUseResult(True, "Группы успешно объединены.")
+
+    def list_linked_groups(self, group_id: int) -> list[Group]:
+        with self.Session() as session:
+            source_group_id = self._workspace_id(session, group_id)
+            chat_ids = [source_group_id]
+            chat_ids.extend(
+                session.scalars(
+                    select(GroupLink.chat_id)
+                    .where(GroupLink.source_group_id == source_group_id)
+                    .order_by(GroupLink.created_at)
+                )
+            )
+            return [
+                group
+                for chat_id in chat_ids
+                if (group := self._group_view(session, chat_id)) is not None
+            ]
+
     def get_group(self, group_id: int) -> Group | None:
         with self.Session() as session:
-            return session.get(Group, group_id)
+            return self._group_view(session, group_id)
 
     def list_groups(self) -> list[Group]:
         with self.Session() as session:
-            return list(
-                session.scalars(select(Group).order_by(Group.created_at.desc()))
+            chat_ids = list(
+                session.scalars(
+                    select(Group.chat_id).order_by(Group.created_at.desc())
+                )
             )
+            return [
+                group
+                for chat_id in chat_ids
+                if (group := self._group_view(session, chat_id)) is not None
+            ]
 
     def update_group(self, group_id: int, **values: Any) -> Group | None:
         allowed = {
@@ -340,7 +506,7 @@ class Repository:
         if unknown:
             raise ValueError(f"Нельзя изменить поля: {', '.join(sorted(unknown))}")
         with self.Session.begin() as session:
-            group = session.get(Group, group_id)
+            group = session.get(Group, self._workspace_id(session, group_id))
             if group is None:
                 return None
             for name, value in values.items():
@@ -349,11 +515,13 @@ class Repository:
 
     def get_role(self, group_id: int, user_id: int) -> str | None:
         with self.Session() as session:
+            group_id = self._workspace_id(session, group_id)
             row = session.get(GroupModerator, (group_id, user_id))
             return row.role if row else None
 
     def list_moderators(self, group_id: int) -> list[GroupModerator]:
         with self.Session() as session:
+            group_id = self._workspace_id(session, group_id)
             return list(
                 session.scalars(
                     select(GroupModerator)
@@ -366,6 +534,7 @@ class Repository:
         self, group_id: int, user_id: int, display_name: str, added_by: int
     ) -> None:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             existing = session.get(GroupModerator, (group_id, user_id))
             if existing:
                 existing.display_name = display_name[:255]
@@ -382,6 +551,7 @@ class Repository:
 
     def remove_moderator(self, group_id: int, user_id: int) -> bool:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             row = session.get(GroupModerator, (group_id, user_id))
             if row is None or row.role == "owner":
                 return False
@@ -396,6 +566,7 @@ class Repository:
         changed_by: int,
     ) -> bool:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             current_owner = session.scalar(
                 select(GroupModerator).where(
                     GroupModerator.group_id == group_id,
@@ -427,6 +598,7 @@ class Repository:
 
     def list_subgroups(self, group_id: int) -> list[Subgroup]:
         with self.Session() as session:
+            group_id = self._workspace_id(session, group_id)
             return list(
                 session.scalars(
                     select(Subgroup)
@@ -437,6 +609,7 @@ class Repository:
 
     def get_subgroup(self, group_id: int, subgroup_id: int) -> Subgroup | None:
         with self.Session() as session:
+            group_id = self._workspace_id(session, group_id)
             return session.scalar(
                 select(Subgroup).where(
                     Subgroup.id == subgroup_id, Subgroup.group_id == group_id
@@ -445,6 +618,7 @@ class Repository:
 
     def add_subgroup(self, group_id: int, name: str) -> Subgroup:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             max_position = session.scalar(
                 select(func.max(Subgroup.position)).where(Subgroup.group_id == group_id)
             )
@@ -458,6 +632,7 @@ class Repository:
 
     def rename_subgroup(self, group_id: int, subgroup_id: int, name: str) -> bool:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             subgroup = session.scalar(
                 select(Subgroup).where(
                     Subgroup.id == subgroup_id, Subgroup.group_id == group_id
@@ -470,6 +645,7 @@ class Repository:
 
     def delete_subgroup(self, group_id: int, subgroup_id: int) -> bool:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             subgroup = session.scalar(
                 select(Subgroup).where(
                     Subgroup.id == subgroup_id, Subgroup.group_id == group_id
@@ -494,6 +670,7 @@ class Repository:
 
     def set_user_subgroup(self, group_id: int, user_id: int, subgroup_id: int) -> bool:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             subgroup = session.scalar(
                 select(Subgroup).where(
                     Subgroup.id == subgroup_id, Subgroup.group_id == group_id
@@ -516,6 +693,7 @@ class Repository:
 
     def get_user_subgroup(self, group_id: int, user_id: int) -> Subgroup | None:
         with self.Session() as session:
+            group_id = self._workspace_id(session, group_id)
             return session.scalar(
                 select(Subgroup)
                 .join(
@@ -531,12 +709,14 @@ class Repository:
 
     def clear_user_subgroup(self, group_id: int, user_id: int) -> None:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             preference = session.get(UserSubgroupPreference, (group_id, user_id))
             if preference is not None:
                 session.delete(preference)
 
     def get_notification_settings(self, group_id: int) -> GroupNotification:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             notification = session.get(GroupNotification, group_id)
             if notification is None:
                 notification = GroupNotification(
@@ -555,6 +735,7 @@ class Repository:
         notification_time: str | None = None,
     ) -> GroupNotification:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             notification = session.get(GroupNotification, group_id)
             if notification is None:
                 notification = GroupNotification(
@@ -571,15 +752,31 @@ class Repository:
 
     def list_enabled_notifications(self) -> list[tuple[Group, GroupNotification]]:
         with self.Session() as session:
-            return list(
-                session.execute(
-                    select(Group, GroupNotification)
-                    .join(
-                        GroupNotification, GroupNotification.group_id == Group.chat_id
-                    )
+            notifications = list(
+                session.scalars(
+                    select(GroupNotification)
+                    .join(Group, Group.chat_id == GroupNotification.group_id)
                     .where(Group.active.is_(True), GroupNotification.enabled.is_(True))
-                ).all()
+                )
             )
+            result: list[tuple[Group, GroupNotification]] = []
+            for notification in notifications:
+                chat_ids = [notification.group_id]
+                chat_ids.extend(
+                    session.scalars(
+                        select(GroupLink.chat_id).where(
+                            GroupLink.source_group_id == notification.group_id
+                        )
+                    )
+                )
+                for chat_id in chat_ids:
+                    physical = session.get(Group, chat_id)
+                    if physical is None or not physical.active:
+                        continue
+                    group = self._group_view(session, chat_id)
+                    if group is not None:
+                        result.append((group, notification))
+            return result
 
     def claim_notification(self, group_id: int, local_date: date) -> bool:
         try:
@@ -608,6 +805,7 @@ class Repository:
         subgroup_id: int | None = None,
     ) -> list[ScheduleEntry]:
         with self.Session() as session:
+            group_id = self._workspace_id(session, group_id)
             return list(
                 session.scalars(
                     select(ScheduleEntry)
@@ -625,6 +823,7 @@ class Repository:
 
     def get_schedule_entry(self, group_id: int, entry_id: int) -> ScheduleEntry | None:
         with self.Session() as session:
+            group_id = self._workspace_id(session, group_id)
             return session.scalar(
                 select(ScheduleEntry).where(
                     ScheduleEntry.id == entry_id, ScheduleEntry.group_id == group_id
@@ -640,6 +839,7 @@ class Repository:
         subgroup_id: int | None = None,
     ) -> ScheduleEntry:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             if subgroup_id is not None:
                 subgroup = session.scalar(
                     select(Subgroup).where(
@@ -675,6 +875,7 @@ class Repository:
         if direction not in {"up", "down"}:
             raise ValueError("Неизвестное направление")
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             entry = session.scalar(
                 select(ScheduleEntry).where(
                     ScheduleEntry.id == entry_id, ScheduleEntry.group_id == group_id
@@ -724,6 +925,7 @@ class Repository:
 
     def update_schedule_entry(self, group_id: int, entry_id: int, text: str) -> bool:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             entry = session.scalar(
                 select(ScheduleEntry).where(
                     ScheduleEntry.id == entry_id, ScheduleEntry.group_id == group_id
@@ -736,6 +938,7 @@ class Repository:
 
     def delete_schedule_entry(self, group_id: int, entry_id: int) -> bool:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             entry = session.scalar(
                 select(ScheduleEntry).where(
                     ScheduleEntry.id == entry_id, ScheduleEntry.group_id == group_id
@@ -750,6 +953,7 @@ class Repository:
         self, group_id: int, template: dict[str, dict[str, list[str]]]
     ) -> None:
         with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
             session.execute(
                 delete(ScheduleEntry).where(ScheduleEntry.group_id == group_id)
             )

@@ -27,6 +27,8 @@ class FakeRepository:
         self.group = group
         self.roles = roles or {}
         self.consumed_setup = None
+        self.created_copy = None
+        self.consumed_copy = None
 
     def get_group(self, group_id):
         return self.group
@@ -40,6 +42,14 @@ class FakeRepository:
     def consume_setup_code(self, **kwargs):
         self.consumed_setup = kwargs
         return SimpleNamespace(ok=True, template_key="blank")
+
+    def create_group_copy_code(self, **kwargs):
+        self.created_copy = kwargs
+        return "COPYCODE12"
+
+    def consume_group_copy_code(self, **kwargs):
+        self.consumed_copy = kwargs
+        return SimpleNamespace(ok=True)
 
 
 def make_message(chat_type, user_id=100, text=None):
@@ -141,3 +151,26 @@ class HelpCommandTests(TestCase):
         text = bot.messages[-1][1]
         self.assertIn("/mods", text)
         self.assertIn("передача владения", text)
+        self.assertIn("/copy", text)
+
+    def test_group_owner_can_create_copy_code(self):
+        bot = FakeBot()
+        group = SimpleNamespace(title="ИКБО-01")
+        repository = FakeRepository(group, roles={100: "owner"})
+        handlers = BotHandlers(bot, repository, make_settings())
+
+        handlers.copy_group(make_message("supergroup", text="/copy"))
+
+        self.assertEqual(repository.created_copy["group_id"], -1001)
+        self.assertIn("/copy COPYCODE12", bot.messages[-1][1])
+
+    def test_participant_cannot_create_copy_code(self):
+        bot = FakeBot()
+        group = SimpleNamespace(title="ИКБО-01")
+        repository = FakeRepository(group)
+        handlers = BotHandlers(bot, repository, make_settings())
+
+        handlers.copy_group(make_message("supergroup", text="/copy"))
+
+        self.assertIsNone(repository.created_copy)
+        self.assertIn("только владелец", bot.messages[-1][1])

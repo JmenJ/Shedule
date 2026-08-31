@@ -164,6 +164,72 @@ class RepositoryTests(unittest.TestCase):
         self.assertTrue(self.repository.claim_notification(-1001, date(2026, 9, 1)))
         self.assertFalse(self.repository.claim_notification(-1001, date(2026, 9, 1)))
 
+    def test_linked_groups_share_schedule_settings_roles_and_subgroups(self):
+        setup_code = self.repository.create_setup_code(100, "blank", 24)
+        self.assertTrue(self.connect_group(-1001, setup_code).ok)
+        self.repository.add_moderator(-1001, 200, "Редактор", 100)
+        subgroup = self.repository.add_subgroup(-1001, "Первая подгруппа")
+        self.repository.add_schedule_entry(-1001, "upper", 0, "Математика")
+        self.repository.update_notification_settings(
+            -1001, enabled=True, notification_time="08:15"
+        )
+
+        copy_code = self.repository.create_group_copy_code(-1001, 100, 24)
+        result = self.repository.consume_group_copy_code(
+            copy_code, -1002, "Второй чат", 300
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(self.repository.resolve_group_id(-1002), -1001)
+        self.assertEqual(self.repository.get_role(-1002, 100), "owner")
+        self.assertEqual(self.repository.get_role(-1002, 200), "moderator")
+        self.assertIsNone(self.repository.get_role(-1002, 300))
+        self.assertEqual(
+            [entry.text for entry in self.repository.list_schedule(-1002, "upper", 0)],
+            ["Математика"],
+        )
+        self.assertEqual(self.repository.list_subgroups(-1002)[0].id, subgroup.id)
+        self.assertTrue(self.repository.get_notification_settings(-1002).enabled)
+
+        self.repository.add_schedule_entry(-1002, "upper", 0, "Физика")
+        self.repository.update_group(-1002, title="Общее расписание")
+        self.repository.rename_subgroup(-1002, subgroup.id, "Подгруппа А")
+
+        self.assertEqual(
+            [entry.text for entry in self.repository.list_schedule(-1001, "upper", 0)],
+            ["Математика", "Физика"],
+        )
+        self.assertEqual(self.repository.get_group(-1001).title, "Общее расписание")
+        self.assertEqual(self.repository.get_group(-1002).title, "Общее расписание")
+        self.assertEqual(self.repository.list_subgroups(-1001)[0].name, "Подгруппа А")
+        self.assertEqual(len(self.repository.list_linked_groups(-1002)), 2)
+
+    def test_copy_code_is_single_use_and_cannot_replace_configured_group(self):
+        for group_id in (-1001, -1003):
+            setup_code = self.repository.create_setup_code(100, "blank", 24)
+            self.assertTrue(self.connect_group(group_id, setup_code).ok)
+
+        first_code = self.repository.create_group_copy_code(-1001, 100, 24)
+        self.assertTrue(
+            self.repository.consume_group_copy_code(
+                first_code, -1002, "Второй чат", 300
+            ).ok
+        )
+        reused = self.repository.consume_group_copy_code(
+            first_code, -1004, "Четвёртый чат", 300
+        )
+
+        second_code = self.repository.create_group_copy_code(-1001, 100, 24)
+        configured = self.repository.consume_group_copy_code(
+            second_code, -1003, "Уже настроен", 300
+        )
+
+        self.assertFalse(reused.ok)
+        self.assertIn("уже использован", reused.message)
+        self.assertFalse(configured.ok)
+        self.assertIn("уже настроена", configured.message)
+        self.assertEqual(self.repository.resolve_group_id(-1003), -1003)
+
 
 if __name__ == "__main__":
     unittest.main()

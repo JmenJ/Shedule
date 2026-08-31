@@ -59,6 +59,7 @@ def configure_telegram() -> None:
         types.BotCommand("myid", "показать мой Telegram ID"),
         types.BotCommand("settings", "настройки этой группы"),
         types.BotCommand("mods", "редакторы этой группы"),
+        types.BotCommand("copy", "объединить чаты одним расписанием"),
         types.BotCommand("cancel", "отменить ввод"),
     ]
     bot.set_my_commands(commands)

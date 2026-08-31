@@ -58,6 +58,7 @@ class BotHandlers:
         self.bot.register_message_handler(self.my_id, commands=["myid", "id"])
         self.bot.register_message_handler(self.admin, commands=["admin"])
         self.bot.register_message_handler(self.setup_group, commands=["setup"])
+        self.bot.register_message_handler(self.copy_group, commands=["copy"])
         self.bot.register_message_handler(self.settings_menu, commands=["settings"])
         self.bot.register_message_handler(self.cancel, commands=["cancel"])
         self.bot.register_message_handler(
@@ -175,7 +176,7 @@ class BotHandlers:
         if group is None:
             self.bot.reply_to(
                 message,
-                "Эта группа ещё не подключена. Участник с одноразовым кодом должен использовать /setup КОД и станет владельцем её настроек.",
+                "Эта группа ещё не подключена. Используйте /setup КОД для нового расписания или /copy КОД, чтобы присоединить её к уже готовому.",
             )
             return
 
@@ -204,6 +205,7 @@ class BotHandlers:
                     "3. Передайте код будущему владельцу расписания.\n"
                     "4. После добавления бота этот человек отправляет в группе /setup КОД.\n\n"
                     "После подключения расписание и права настраиваются командой /settings внутри нужной группы.\n"
+                    "Чтобы подключить ещё один чат к уже готовому расписанию, владелец группы создаёт код командой /copy.\n"
                     "Ваш Telegram ID можно посмотреть командой /myid.",
                     reply_markup=self.admin_keyboard(),
                 )
@@ -224,6 +226,7 @@ class BotHandlers:
                 "1. Отправьте здесь /setup КОД.\n"
                 "2. Вы станете владельцем настроек этой группы.\n"
                 "3. Откройте /settings и заполните расписание.\n\n"
+                "Если это ещё один чат уже настроенной учебной группы, отправьте /copy КОД, созданный владельцем в исходном чате.\n\n"
                 "Статус администратора Telegram для этого не требуется."
             )
             self.bot.reply_to(message, text)
@@ -264,6 +267,7 @@ class BotHandlers:
                     "• /mods — список владельца и модераторов;",
                     "• ответьте на сообщение человека командой /mod_add или /mod_remove;",
                     "• передача владения находится в /settings → «Модераторы».",
+                    "• /copy — создать одноразовый код для подключения ещё одного чата к этому же расписанию.",
                 ]
             )
 
@@ -344,6 +348,73 @@ class BotHandlers:
             reply_markup=self.settings_keyboard(),
         )
 
+    def copy_group(self, message: types.Message) -> None:
+        if message.chat.type not in GROUP_CHAT_TYPES:
+            self.bot.reply_to(
+                message,
+                "Команда /copy используется внутри Telegram-группы.",
+            )
+            return
+
+        parts = (message.text or "").split(maxsplit=1)
+        group = self.repository.get_group(message.chat.id)
+
+        if len(parts) == 2 and parts[1].strip():
+            if group is not None:
+                self.bot.reply_to(
+                    message,
+                    "Эта группа уже настроена. Код объединения нужно вводить в новой, ещё не подключённой группе.",
+                )
+                return
+            result = self.repository.consume_group_copy_code(
+                code=parts[1],
+                target_group_id=message.chat.id,
+                target_group_title=message.chat.title or str(message.chat.id),
+                used_by=message.from_user.id,
+            )
+            if not result.ok:
+                self.bot.reply_to(message, result.message)
+                return
+            self.bot.reply_to(
+                message,
+                "Группа подключена к общему расписанию ✅\n\n"
+                "Расписание, настройки, владелец и модераторы теперь общие с исходной группой. "
+                "Изменения из любого подключённого чата сразу действуют во всех.",
+                reply_markup=self.schedule_keyboard(
+                    message.chat.id,
+                    message.from_user.id,
+                    self.can_manage_group(message.chat.id, message.from_user.id),
+                ),
+            )
+            return
+
+        if group is None:
+            self.bot.reply_to(
+                message,
+                "Эта группа ещё не подключена. Получите код в исходной группе командой /copy, затем отправьте здесь /copy КОД.",
+            )
+            return
+        if not self.can_manage_moderators(message.chat.id, message.from_user.id):
+            self.bot.reply_to(
+                message,
+                "Создавать код объединения может только владелец расписания.",
+            )
+            return
+
+        code = self.repository.create_group_copy_code(
+            group_id=message.chat.id,
+            created_by=message.from_user.id,
+            ttl_hours=self.settings.setup_code_ttl_hours,
+        )
+        self.bot.reply_to(
+            message,
+            f"Код объединения: {code}\n\n"
+            f"Он действует {self.settings.setup_code_ttl_hours} ч. и используется один раз.\n"
+            "Добавьте бота в другой, ещё не настроенный чат и отправьте там:\n\n"
+            f"/copy {code}\n\n"
+            "После подключения расписание, настройки, владелец и модераторы будут общими.",
+        )
+
     def settings_menu(self, message: types.Message) -> None:
         if message.chat.type not in GROUP_CHAT_TYPES:
             self.bot.reply_to(
@@ -394,6 +465,7 @@ class BotHandlers:
     def settings_text(self, group: Group) -> str:
         week_type = current_week_type(group)
         notification = self.repository.get_notification_settings(group.chat_id)
+        linked_chat_count = len(self.repository.list_linked_groups(group.chat_id))
         notification_text = (
             f"включена, {notification.notification_time}"
             if notification.enabled
@@ -404,8 +476,9 @@ class BotHandlers:
             f"Часовой пояс: {group.timezone}\n"
             f"Текущая неделя: {WEEK_LABELS[week_type]}\n\n"
             f"Утренняя рассылка: {notification_text}\n"
-            f"Подгрупп: {len(self.repository.list_subgroups(group.chat_id))}\n\n"
-            "Расписание и права относятся только к этой группе."
+            f"Подгрупп: {len(self.repository.list_subgroups(group.chat_id))}\n"
+            f"Объединённых чатов: {linked_chat_count}\n\n"
+            "Расписание, настройки и права общие для всех объединённых чатов."
         )
 
     def send_settings_panel(self, chat_id: int) -> None:
