@@ -3,7 +3,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 
-from database import Repository
+from database import Repository, ScheduleEntry
 
 
 class RepositoryTests(unittest.TestCase):
@@ -45,12 +45,30 @@ class RepositoryTests(unittest.TestCase):
             self.assertTrue(self.connect_group(group_id, code).ok)
 
         self.repository.add_schedule_entry(-1001, "upper", 0, "1. Математика")
-        self.repository.add_schedule_entry(-1002, "upper", 0, "1. Физика")
+        self.repository.add_schedule_entry(-1002, "upper", 0, "2. Физика")
 
         group_one = self.repository.list_schedule(-1001, "upper", 0)
         group_two = self.repository.list_schedule(-1002, "upper", 0)
-        self.assertEqual([entry.text for entry in group_one], ["1. Математика"])
-        self.assertEqual([entry.text for entry in group_two], ["1. Физика"])
+        self.assertEqual([entry.text for entry in group_one], ["Математика"])
+        self.assertEqual([entry.text for entry in group_two], ["Физика"])
+
+    def test_existing_numbered_entries_are_normalized_on_startup(self):
+        with self.repository.Session.begin() as session:
+            session.add(
+                ScheduleEntry(
+                    group_id=-1001,
+                    week_type="upper",
+                    day_of_week=0,
+                    position=1,
+                    text="1. 2. Старое занятие",
+                )
+            )
+
+        changed = self.repository.normalize_existing_schedule_entries()
+
+        entries = self.repository.list_schedule(-1001, "upper", 0)
+        self.assertEqual(changed, 1)
+        self.assertEqual(entries[0].text, "Старое занятие")
 
     def test_moderator_role_is_scoped_to_one_group(self):
         for group_id in (-1001, -1002):

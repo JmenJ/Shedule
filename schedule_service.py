@@ -87,7 +87,9 @@ def format_schedule(
     if subgroup is not None:
         header += f"\n👤 {subgroup.name}"
     body = (
-        "\n\n".join(entry.text for entry in entries)
+        "\n\n".join(
+            f"{index}. {entry.text}" for index, entry in enumerate(entries, start=1)
+        )
         if entries
         else group.empty_day_text
     )

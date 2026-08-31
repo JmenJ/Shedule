@@ -54,7 +54,17 @@ class ScheduleServiceTests(unittest.TestCase):
         )
         text = format_schedule(self.repository, self.group, date(2026, 8, 31))
         self.assertIn("Верхняя неделя", text)
-        self.assertIn("Математика", text)
+        self.assertIn("1. Математика", text)
+        self.assertNotIn("1. 1. Математика", text)
+
+    def test_moving_entries_updates_display_numbers(self):
+        self.repository.add_schedule_entry(-1001, "upper", 0, "Первая")
+        second = self.repository.add_schedule_entry(-1001, "upper", 0, "Вторая")
+
+        self.repository.move_schedule_entry(-1001, second.id, "up")
+        text = format_schedule(self.repository, self.group, date(2026, 8, 31))
+
+        self.assertLess(text.index("1. Вторая"), text.index("2. Первая"))
 
     def test_subgroup_schedule_includes_common_and_personal_entries(self):
         subgroup = self.repository.add_subgroup(-1001, "Подгруппа 1")

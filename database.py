@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -29,6 +30,14 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 def utc_now() -> datetime:
     # Naive UTC keeps SQLite and PostgreSQL comparisons consistent.
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+LEADING_LESSON_NUMBER = re.compile(r"^\s*(?:\d+\.\s+)+")
+
+
+def normalize_schedule_text(text: str) -> str:
+    """Store lesson text without display numbering managed by the bot."""
+    return LEADING_LESSON_NUMBER.sub("", text).strip()
 
 
 class Base(DeclarativeBase):
@@ -194,6 +203,17 @@ class Repository:
 
     def create_schema(self) -> None:
         Base.metadata.create_all(self.engine)
+        self.normalize_existing_schedule_entries()
+
+    def normalize_existing_schedule_entries(self) -> int:
+        changed = 0
+        with self.Session.begin() as session:
+            for entry in session.scalars(select(ScheduleEntry)):
+                normalized = normalize_schedule_text(entry.text)
+                if normalized != entry.text:
+                    entry.text = normalized
+                    changed += 1
+        return changed
 
     @staticmethod
     def _hash_code(code: str) -> str:
@@ -644,7 +664,7 @@ class Repository:
                 week_type=week_type,
                 day_of_week=day_of_week,
                 position=(max_position or 0) + 1,
-                text=text,
+                text=normalize_schedule_text(text),
             )
             session.add(entry)
             return entry
@@ -711,7 +731,7 @@ class Repository:
             )
             if entry is None:
                 return False
-            entry.text = text
+            entry.text = normalize_schedule_text(text)
             return True
 
     def delete_schedule_entry(self, group_id: int, entry_id: int) -> bool:
@@ -745,7 +765,7 @@ class Repository:
                                 week_type=week_type,
                                 day_of_week=day_of_week,
                                 position=position,
-                                text=text,
+                                text=normalize_schedule_text(text),
                             )
                         )
 
