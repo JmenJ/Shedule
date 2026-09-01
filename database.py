@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import secrets
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -33,11 +34,25 @@ def utc_now() -> datetime:
 
 
 LEADING_LESSON_NUMBER = re.compile(r"^\s*(?:\d+\.\s+)+")
+TRAILING_LESSON_TIME = re.compile(
+    r"(?P<start>(?:[01]\d|2[0-3]):[0-5]\d)\s*[-–—]\s*"
+    r"(?P<end>(?:[01]\d|2[0-3]):[0-5]\d)\s*$"
+)
+
+
+def split_schedule_time(text: str) -> tuple[str, tuple[str, str] | None]:
+    """Separate a legacy trailing time range from the lesson description."""
+    normalized = LEADING_LESSON_NUMBER.sub("", text).strip()
+    match = TRAILING_LESSON_TIME.search(normalized)
+    if match is None:
+        return normalized, None
+    description = normalized[: match.start()].rstrip(" \t,;:-–—")
+    return description, (match.group("start"), match.group("end"))
 
 
 def normalize_schedule_text(text: str) -> str:
-    """Store lesson text without display numbering managed by the bot."""
-    return LEADING_LESSON_NUMBER.sub("", text).strip()
+    """Store lesson text without numbering or a group-wide lesson time."""
+    return split_schedule_time(text)[0]
 
 
 class Base(DeclarativeBase):
@@ -127,6 +142,17 @@ class ScheduleEntry(Base):
     day_of_week: Mapped[int] = mapped_column(Integer, index=True)
     position: Mapped[int] = mapped_column(Integer)
     text: Mapped[str] = mapped_column(Text)
+
+
+class LessonTime(Base):
+    __tablename__ = "lesson_times"
+
+    group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("groups.chat_id", ondelete="CASCADE"), primary_key=True
+    )
+    lesson_number: Mapped[int] = mapped_column(Integer, primary_key=True)
+    start_time: Mapped[str] = mapped_column(String(5))
+    end_time: Mapped[str] = mapped_column(String(5))
 
 
 class UserSubgroupPreference(Base):
@@ -232,7 +258,39 @@ class Repository:
 
     def create_schema(self) -> None:
         Base.metadata.create_all(self.engine)
+        self.migrate_legacy_lesson_times()
         self.normalize_existing_schedule_entries()
+
+    def migrate_legacy_lesson_times(self) -> int:
+        """Infer shared times from old lesson descriptions without losing subjects."""
+        candidates: dict[tuple[int, int], Counter[tuple[str, str]]] = defaultdict(
+            Counter
+        )
+        with self.Session.begin() as session:
+            existing = {
+                (item.group_id, item.lesson_number)
+                for item in session.scalars(select(LessonTime))
+            }
+            for entry in session.scalars(select(ScheduleEntry)):
+                _, time_range = split_schedule_time(entry.text)
+                if time_range is not None and 1 <= entry.position <= 8:
+                    candidates[(entry.group_id, entry.position)][time_range] += 1
+
+            created = 0
+            for (group_id, lesson_number), values in candidates.items():
+                if (group_id, lesson_number) in existing:
+                    continue
+                (start_time, end_time), _ = values.most_common(1)[0]
+                session.add(
+                    LessonTime(
+                        group_id=group_id,
+                        lesson_number=lesson_number,
+                        start_time=start_time,
+                        end_time=end_time,
+                    )
+                )
+                created += 1
+            return created
 
     def normalize_existing_schedule_entries(self) -> int:
         changed = 0
@@ -797,6 +855,78 @@ class Repository:
                 )
             )
 
+    @staticmethod
+    def _validate_lesson_time(
+        lesson_number: int, start_time: str, end_time: str
+    ) -> None:
+        if lesson_number not in range(1, 9):
+            raise ValueError("Номер пары должен быть от 1 до 8.")
+        time_pattern = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
+        if not time_pattern.fullmatch(start_time) or not time_pattern.fullmatch(
+            end_time
+        ):
+            raise ValueError("Время должно быть в формате ЧЧ:ММ.")
+        if start_time >= end_time:
+            raise ValueError("Время окончания должно быть позже времени начала.")
+
+    def list_lesson_times(self, group_id: int) -> list[LessonTime]:
+        with self.Session() as session:
+            group_id = self._workspace_id(session, group_id)
+            return list(
+                session.scalars(
+                    select(LessonTime)
+                    .where(LessonTime.group_id == group_id)
+                    .order_by(LessonTime.lesson_number)
+                )
+            )
+
+    def set_lesson_times(
+        self, group_id: int, values: dict[int, tuple[str, str]]
+    ) -> list[LessonTime]:
+        for lesson_number, (start_time, end_time) in values.items():
+            self._validate_lesson_time(lesson_number, start_time, end_time)
+
+        with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
+            for lesson_number, (start_time, end_time) in values.items():
+                item = session.get(LessonTime, (group_id, lesson_number))
+                if item is None:
+                    item = LessonTime(
+                        group_id=group_id,
+                        lesson_number=lesson_number,
+                        start_time=start_time,
+                        end_time=end_time,
+                    )
+                    session.add(item)
+                else:
+                    item.start_time = start_time
+                    item.end_time = end_time
+
+        return self.list_lesson_times(group_id)
+
+    def set_lesson_time(
+        self, group_id: int, lesson_number: int, start_time: str, end_time: str
+    ) -> LessonTime:
+        self.set_lesson_times(
+            group_id, {lesson_number: (start_time, end_time)}
+        )
+        return next(
+            item
+            for item in self.list_lesson_times(group_id)
+            if item.lesson_number == lesson_number
+        )
+
+    def clear_lesson_time(self, group_id: int, lesson_number: int) -> bool:
+        if lesson_number not in range(1, 9):
+            raise ValueError("Номер пары должен быть от 1 до 8.")
+        with self.Session.begin() as session:
+            group_id = self._workspace_id(session, group_id)
+            item = session.get(LessonTime, (group_id, lesson_number))
+            if item is None:
+                return False
+            session.delete(item)
+            return True
+
     def list_schedule(
         self,
         group_id: int,
@@ -957,21 +1087,36 @@ class Repository:
             session.execute(
                 delete(ScheduleEntry).where(ScheduleEntry.group_id == group_id)
             )
+            session.execute(delete(LessonTime).where(LessonTime.group_id == group_id))
+            time_candidates: dict[int, Counter[tuple[str, str]]] = defaultdict(Counter)
             for week_type, days in template.items():
                 if week_type not in {"upper", "lower"}:
                     continue
                 for day_key, entries in days.items():
                     day_of_week = int(day_key)
                     for position, text in enumerate(entries, start=1):
+                        normalized_text, time_range = split_schedule_time(text)
+                        if time_range is not None and position <= 8:
+                            time_candidates[position][time_range] += 1
                         session.add(
                             ScheduleEntry(
                                 group_id=group_id,
                                 week_type=week_type,
                                 day_of_week=day_of_week,
                                 position=position,
-                                text=normalize_schedule_text(text),
+                                text=normalized_text,
                             )
                         )
+            for lesson_number, values in time_candidates.items():
+                (start_time, end_time), _ = values.most_common(1)[0]
+                session.add(
+                    LessonTime(
+                        group_id=group_id,
+                        lesson_number=lesson_number,
+                        start_time=start_time,
+                        end_time=end_time,
+                    )
+                )
 
     def set_state(
         self,

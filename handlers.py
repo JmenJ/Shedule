@@ -17,6 +17,7 @@ from schedule_service import (
     SHORT_DAYS_RU,
     WEEK_LABELS,
     current_week_type,
+    format_lesson_line,
     format_schedule,
     monday_for,
     target_date_for_action,
@@ -24,6 +25,50 @@ from schedule_service import (
 
 LOGGER = logging.getLogger(__name__)
 GROUP_CHAT_TYPES = {"group", "supergroup"}
+LESSON_TIME_INPUT = re.compile(
+    r"(?P<start>(?:[01]\d|2[0-3]):[0-5]\d)\s*[-–—]\s*"
+    r"(?P<end>(?:[01]\d|2[0-3]):[0-5]\d)"
+)
+LESSON_TIME_BULK_LINE = re.compile(
+    r"(?P<number>[1-8])[.)]?\s+"
+    r"(?P<start>(?:[01]\d|2[0-3]):[0-5]\d)\s*[-–—]\s*"
+    r"(?P<end>(?:[01]\d|2[0-3]):[0-5]\d)"
+)
+
+
+def parse_lesson_time_range(value: str) -> tuple[str, str]:
+    match = LESSON_TIME_INPUT.fullmatch(value.strip())
+    if match is None:
+        raise ValueError("Используйте формат ЧЧ:ММ-ЧЧ:ММ, например 08:00-09:30.")
+    start_time, end_time = match.group("start"), match.group("end")
+    if start_time >= end_time:
+        raise ValueError("Время окончания должно быть позже времени начала.")
+    return start_time, end_time
+
+
+def parse_lesson_times_bulk(value: str) -> dict[int, tuple[str, str]]:
+    result: dict[int, tuple[str, str]] = {}
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = LESSON_TIME_BULK_LINE.fullmatch(line)
+        if match is None:
+            raise ValueError(
+                f"Не удалось разобрать строку «{line}». Пример: 1. 08:00-09:30"
+            )
+        lesson_number = int(match.group("number"))
+        if lesson_number in result:
+            raise ValueError(f"Время {lesson_number}-й пары указано дважды.")
+        start_time, end_time = match.group("start"), match.group("end")
+        if start_time >= end_time:
+            raise ValueError(
+                f"У {lesson_number}-й пары окончание должно быть позже начала."
+            )
+        result[lesson_number] = (start_time, end_time)
+    if not result:
+        raise ValueError("Укажите время хотя бы для одной пары.")
+    return result
 
 
 class CallbackNotice(Exception):
@@ -253,7 +298,7 @@ class BotHandlers:
                 [
                     "",
                     f"⚙️ Ваша роль: {role_label}.",
-                    "• /settings — расписание, подгруппы, тексты, часовой пояс, недели и утренняя рассылка;",
+                    "• /settings — расписание, общее время занятий 1–8, подгруппы, тексты, часовой пояс, недели и утренняя рассылка;",
                     "• при редактировании дня кнопки ↑ и ↓ меняют порядок занятий;",
                     "• /cancel — отменить текущий ввод.",
                 ]
@@ -442,6 +487,11 @@ class BotHandlers:
         )
         markup.row(
             types.InlineKeyboardButton(
+                "⏱ Время занятий 1–8", callback_data="cfg:times"
+            )
+        )
+        markup.row(
+            types.InlineKeyboardButton(
                 "🔁 Чередование недель", callback_data="cfg:anchor"
             ),
             types.InlineKeyboardButton("🌍 Часовой пояс", callback_data="cfg:timezone"),
@@ -465,6 +515,9 @@ class BotHandlers:
     def settings_text(self, group: Group) -> str:
         week_type = current_week_type(group)
         notification = self.repository.get_notification_settings(group.chat_id)
+        configured_lesson_times = len(
+            self.repository.list_lesson_times(group.chat_id)
+        )
         linked_chat_count = len(self.repository.list_linked_groups(group.chat_id))
         notification_text = (
             f"включена, {notification.notification_time}"
@@ -475,6 +528,7 @@ class BotHandlers:
             f"⚙️ Настройки «{group.title}»\n\n"
             f"Часовой пояс: {group.timezone}\n"
             f"Текущая неделя: {WEEK_LABELS[week_type]}\n\n"
+            f"Время занятий: настроено {configured_lesson_times} из 8\n"
             f"Утренняя рассылка: {notification_text}\n"
             f"Подгрупп: {len(self.repository.list_subgroups(group.chat_id))}\n"
             f"Объединённых чатов: {linked_chat_count}\n\n"
@@ -685,6 +739,34 @@ class BotHandlers:
             )
         elif action == "schedule":
             self.show_schedule_scopes(call)
+        elif action == "times":
+            self.show_lesson_times_settings(call)
+        elif action == "timeedit" and len(parts) == 3:
+            lesson_number = int(parts[2])
+            if lesson_number not in range(1, 9):
+                raise CallbackNotice("Номер пары должен быть от 1 до 8.")
+            self.begin_text_input(
+                call,
+                "lesson_time_single",
+                {"lesson_number": lesson_number},
+                f"Ответьте временем {lesson_number}-й пары в формате ЧЧ:ММ-ЧЧ:ММ, "
+                "например 08:00-09:30.\n"
+                "Чтобы удалить настроенное время, отправьте один знак «-».\n\n"
+                "Отмена: /cancel",
+            )
+        elif action == "timesbulk":
+            self.begin_text_input(
+                call,
+                "lesson_times_bulk",
+                {},
+                "Ответьте списком времён. Можно указать любое количество пар от 1 до 8; "
+                "неперечисленные настройки останутся без изменений.\n\n"
+                "Пример:\n"
+                "1. 08:00-09:30\n"
+                "2. 09:40-11:10\n"
+                "3. 11:20-12:50\n\n"
+                "Отмена: /cancel",
+            )
         elif action == "scope" and len(parts) == 3:
             self.show_scope_weeks(call, parts[2])
         elif action == "week" and len(parts) == 4:
@@ -701,8 +783,9 @@ class BotHandlers:
                     "week_type": parts[3],
                     "day_of_week": int(parts[4]),
                 },
-                "Ответьте на это сообщение текстом занятия. Формат свободный, например:\n"
-                "1. Математика, ауд. 204, 08:00–09:30\n\nОтмена: /cancel",
+                "Ответьте на это сообщение названием и описанием занятия. Время вводить "
+                "не нужно — оно подставится по номеру пары автоматически. Например:\n"
+                "Математика, ауд. 204\n\nОтмена: /cancel",
             )
         elif action == "edit" and len(parts) == 3:
             entry = self.repository.get_schedule_entry(group_id, int(parts[2]))
@@ -909,6 +992,62 @@ class BotHandlers:
         subgroup = self.repository.get_subgroup(group_id, subgroup_id)
         return subgroup.name if subgroup is not None else "Подгруппа"
 
+    def lesson_times_keyboard(self, group_id: int) -> types.InlineKeyboardMarkup:
+        configured = {
+            item.lesson_number: item
+            for item in self.repository.list_lesson_times(group_id)
+        }
+        markup = types.InlineKeyboardMarkup()
+        for start in (1, 3, 5, 7):
+            buttons = []
+            for lesson_number in range(start, start + 2):
+                item = configured.get(lesson_number)
+                label = (
+                    f"{lesson_number}. {item.start_time}–{item.end_time}"
+                    if item is not None
+                    else f"{lesson_number}. не задано"
+                )
+                buttons.append(
+                    types.InlineKeyboardButton(
+                        label, callback_data=f"cfg:timeedit:{lesson_number}"
+                    )
+                )
+            markup.row(*buttons)
+        markup.row(
+            types.InlineKeyboardButton(
+                "📝 Задать несколько одним сообщением",
+                callback_data="cfg:timesbulk",
+            )
+        )
+        markup.row(types.InlineKeyboardButton("← Настройки", callback_data="cfg:home"))
+        return markup
+
+    def show_lesson_times_settings(self, call: types.CallbackQuery) -> None:
+        configured = {
+            item.lesson_number: item
+            for item in self.repository.list_lesson_times(call.message.chat.id)
+        }
+        lines = [
+            "⏱ Время занятий",
+            "",
+            "Настройте интервалы один раз. Бот будет автоматически добавлять время "
+            "к занятиям по их порядковому номеру.",
+            "",
+        ]
+        for lesson_number in range(1, 9):
+            item = configured.get(lesson_number)
+            value = (
+                f"{item.start_time}–{item.end_time}"
+                if item is not None
+                else "не задано"
+            )
+            lines.append(f"{lesson_number}. {value}")
+        self.safe_edit(
+            call,
+            "\n".join(lines),
+            self.lesson_times_keyboard(call.message.chat.id),
+        )
+
     def show_schedule_scopes(self, call: types.CallbackQuery) -> None:
         group_id = call.message.chat.id
         markup = types.InlineKeyboardMarkup()
@@ -984,6 +1123,10 @@ class BotHandlers:
         entries = self.repository.list_schedule(
             group_id, week_type, day_of_week, subgroup_id=subgroup_id
         )
+        lesson_times = {
+            item.lesson_number: item
+            for item in self.repository.list_lesson_times(group_id)
+        }
         lines = [
             (
                 f"{self.scope_label(group_id, scope_token)}\n"
@@ -991,7 +1134,8 @@ class BotHandlers:
             )
         ]
         lines.extend(
-            f"{index}. {entry.text}" for index, entry in enumerate(entries, start=1)
+            format_lesson_line(index, entry.text, lesson_times)
+            for index, entry in enumerate(entries, start=1)
         )
         if not entries:
             lines.append("Занятий пока нет.")
@@ -1076,6 +1220,7 @@ class BotHandlers:
             )
             return
 
+        result_markup = self.settings_keyboard()
         try:
             if state.action == "add_entry":
                 if len(value) > 300:
@@ -1088,9 +1233,9 @@ class BotHandlers:
                     int(state.payload["day_of_week"]),
                     subgroup_id=state.payload.get("subgroup_id"),
                 )
-                if len(current_entries) >= 12:
+                if len(current_entries) >= 8:
                     raise ValueError(
-                        "На один день можно добавить не больше 12 занятий."
+                        "На один день можно добавить не больше 8 занятий."
                     )
                 self.repository.add_schedule_entry(
                     message.chat.id,
@@ -1110,6 +1255,28 @@ class BotHandlers:
                 ):
                     raise ValueError("Занятие уже удалено.")
                 result_text = "Занятие обновлено ✅"
+            elif state.action == "lesson_time_single":
+                lesson_number = int(state.payload["lesson_number"])
+                if value in {"-", "—", "нет"}:
+                    self.repository.clear_lesson_time(
+                        message.chat.id, lesson_number
+                    )
+                    result_text = f"Время {lesson_number}-й пары удалено ✅"
+                else:
+                    start_time, end_time = parse_lesson_time_range(value)
+                    self.repository.set_lesson_time(
+                        message.chat.id, lesson_number, start_time, end_time
+                    )
+                    result_text = (
+                        f"Время {lesson_number}-й пары: "
+                        f"{start_time}–{end_time} ✅"
+                    )
+                result_markup = self.lesson_times_keyboard(message.chat.id)
+            elif state.action == "lesson_times_bulk":
+                values = parse_lesson_times_bulk(value)
+                self.repository.set_lesson_times(message.chat.id, values)
+                result_text = f"Обновлено интервалов: {len(values)} ✅"
+                result_markup = self.lesson_times_keyboard(message.chat.id)
             elif state.action == "timezone":
                 try:
                     ZoneInfo(value)
@@ -1174,7 +1341,7 @@ class BotHandlers:
             return
 
         self.repository.clear_state(message.chat.id, message.from_user.id)
-        self.bot.reply_to(message, result_text, reply_markup=self.settings_keyboard())
+        self.bot.reply_to(message, result_text, reply_markup=result_markup)
 
     def show_notification_settings(self, call: types.CallbackQuery) -> None:
         group = self.repository.get_group(call.message.chat.id)

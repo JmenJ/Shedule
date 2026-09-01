@@ -2,7 +2,7 @@ from types import SimpleNamespace
 from unittest import TestCase
 
 from config import Settings
-from handlers import BotHandlers
+from handlers import BotHandlers, parse_lesson_time_range, parse_lesson_times_bulk
 
 
 class FakeBot:
@@ -174,3 +174,26 @@ class HelpCommandTests(TestCase):
 
         self.assertIsNone(repository.created_copy)
         self.assertIn("только владелец", bot.messages[-1][1])
+
+
+class LessonTimeInputTests(TestCase):
+    def test_single_time_accepts_common_dash_variants(self):
+        self.assertEqual(
+            parse_lesson_time_range("08:00–09:30"), ("08:00", "09:30")
+        )
+
+    def test_bulk_input_accepts_numbered_lines(self):
+        self.assertEqual(
+            parse_lesson_times_bulk(
+                "1. 08:00-09:30\n2 09:40–11:10\n8) 18:00—19:30"
+            ),
+            {
+                1: ("08:00", "09:30"),
+                2: ("09:40", "11:10"),
+                8: ("18:00", "19:30"),
+            },
+        )
+
+    def test_bulk_input_rejects_duplicate_lesson_numbers(self):
+        with self.assertRaisesRegex(ValueError, "дважды"):
+            parse_lesson_times_bulk("1. 08:00-09:30\n1. 09:40-11:10")

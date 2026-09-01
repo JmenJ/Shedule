@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from database import Group, Repository
+from database import Group, LessonTime, Repository
 
 DAYS_RU = (
     "Понедельник",
@@ -16,6 +16,20 @@ DAYS_RU = (
 )
 SHORT_DAYS_RU = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 WEEK_LABELS = {"upper": "Верхняя", "lower": "Нижняя"}
+
+
+def format_lesson_line(
+    lesson_number: int,
+    text: str,
+    lesson_times: dict[int, LessonTime],
+) -> str:
+    configured_time = lesson_times.get(lesson_number)
+    if configured_time is None:
+        return f"{lesson_number}. {text}"
+    return (
+        f"{lesson_number}. {configured_time.start_time}–"
+        f"{configured_time.end_time} — {text}"
+    )
 
 
 def monday_for(value: date) -> date:
@@ -83,12 +97,17 @@ def format_schedule(
         [*common_entries, *subgroup_entries],
         key=lambda entry: (entry.position, entry.id),
     )
+    lesson_times = {
+        item.lesson_number: item
+        for item in repository.list_lesson_times(group.chat_id)
+    }
     header = f"📅 {DAYS_RU[day_of_week]} ({WEEK_LABELS[week_type]} неделя):"
     if subgroup is not None:
         header += f"\n👤 {subgroup.name}"
     body = (
         "\n\n".join(
-            f"{index}. {entry.text}" for index, entry in enumerate(entries, start=1)
+            format_lesson_line(index, entry.text, lesson_times)
+            for index, entry in enumerate(entries, start=1)
         )
         if entries
         else group.empty_day_text
