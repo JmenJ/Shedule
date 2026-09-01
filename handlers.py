@@ -141,9 +141,8 @@ class BotHandlers:
             or self.repository.get_role(group_id, user_id) == "owner"
         )
 
-    def schedule_keyboard(
-        self, group_id: int, user_id: int, show_settings: bool = False
-    ) -> types.InlineKeyboardMarkup:
+    @staticmethod
+    def schedule_keyboard() -> types.InlineKeyboardMarkup:
         markup = types.InlineKeyboardMarkup()
         markup.row(
             types.InlineKeyboardButton("Сегодня", callback_data="view:today"),
@@ -161,23 +160,6 @@ class BotHandlers:
                 for index, label in enumerate(SHORT_DAYS_RU[4:], start=4)
             ]
         )
-        subgroups = self.repository.list_subgroups(group_id)
-        if subgroups:
-            selected = self.repository.get_user_subgroup(group_id, user_id)
-            label = (
-                f"👤 {truncate(selected.name, 28)}"
-                if selected is not None
-                else "👤 Выбрать подгруппу"
-            )
-            markup.row(
-                types.InlineKeyboardButton(label, callback_data="view:subgroups")
-            )
-        if show_settings:
-            markup.row(
-                types.InlineKeyboardButton(
-                    "⚙️ Настройки группы", callback_data="cfg:home"
-                )
-            )
         return markup
 
     @staticmethod
@@ -228,11 +210,7 @@ class BotHandlers:
         self.bot.send_message(
             message.chat.id,
             group.welcome_text,
-            reply_markup=self.schedule_keyboard(
-                message.chat.id,
-                message.from_user.id,
-                self.can_manage_group(message.chat.id, message.from_user.id),
-            ),
+            reply_markup=self.schedule_keyboard(),
         )
 
     def help_command(self, message: types.Message) -> None:
@@ -284,7 +262,8 @@ class BotHandlers:
             "Для просмотра:",
             "• /start — открыть расписание;",
             "• кнопки «Сегодня», «Завтра» и дни недели — выбрать день;",
-            "• «Выбрать подгруппу» — один раз указать свою подгруппу; выбор запомнится только для этой группы;",
+            "• при первом выборе дня бот один раз попросит указать подгруппу и запомнит её;",
+            "• /settings — посмотреть или изменить свою подгруппу;",
             "• /myid — показать ваш Telegram ID.",
         ]
 
@@ -319,11 +298,7 @@ class BotHandlers:
         self.bot.send_message(
             message.chat.id,
             "\n".join(lines),
-            reply_markup=self.schedule_keyboard(
-                message.chat.id,
-                user_id,
-                self.can_manage_group(message.chat.id, user_id),
-            ),
+            reply_markup=self.schedule_keyboard(),
         )
 
     def my_id(self, message: types.Message) -> None:
@@ -425,11 +400,7 @@ class BotHandlers:
                 "Группа подключена к общему расписанию ✅\n\n"
                 "Расписание, настройки, владелец и модераторы теперь общие с исходной группой. "
                 "Изменения из любого подключённого чата сразу действуют во всех.",
-                reply_markup=self.schedule_keyboard(
-                    message.chat.id,
-                    message.from_user.id,
-                    self.can_manage_group(message.chat.id, message.from_user.id),
-                ),
+                reply_markup=self.schedule_keyboard(),
             )
             return
 
@@ -466,12 +437,14 @@ class BotHandlers:
                 message, "Настройки группы открываются командой /settings внутри неё."
             )
             return
-        if not self.can_manage_group(message.chat.id, message.from_user.id):
-            self.bot.reply_to(
-                message, "У вас нет прав на изменение настроек этой группы."
-            )
+        group = self.repository.get_group(message.chat.id)
+        if group is None:
+            self.bot.reply_to(message, "Группа ещё не настроена.")
             return
-        self.send_settings_panel(message.chat.id)
+        if self.can_manage_group(message.chat.id, message.from_user.id):
+            self.send_settings_panel(message.chat.id)
+        else:
+            self.send_user_settings_panel(message.chat.id, message.from_user.id)
 
     def cancel(self, message: types.Message) -> None:
         self.repository.clear_state(message.chat.id, message.from_user.id)
@@ -507,6 +480,11 @@ class BotHandlers:
             types.InlineKeyboardButton("👥 Подгруппы", callback_data="cfg:subs"),
         )
         markup.row(types.InlineKeyboardButton("🛡 Модераторы", callback_data="cfg:mods"))
+        markup.row(
+            types.InlineKeyboardButton(
+                "👤 Моя подгруппа", callback_data="usr:home"
+            )
+        )
         markup.row(
             types.InlineKeyboardButton("🗓 Открыть расписание", callback_data="cfg:show")
         )
@@ -544,6 +522,50 @@ class BotHandlers:
             chat_id, self.settings_text(group), reply_markup=self.settings_keyboard()
         )
 
+    def user_settings_text(self, group: Group, user_id: int) -> str:
+        selected = self.repository.get_user_subgroup(group.chat_id, user_id)
+        subgroup_text = selected.name if selected is not None else "ещё не выбрана"
+        return (
+            "⚙️ Личные настройки расписания\n\n"
+            f"Подгруппа: {subgroup_text}\n\n"
+            "Выбор сохраняется только для вас. После первого выбора бот будет "
+            "автоматически показывать расписание этой подгруппы."
+        )
+
+    def user_settings_keyboard(
+        self, group_id: int, user_id: int
+    ) -> types.InlineKeyboardMarkup:
+        markup = types.InlineKeyboardMarkup()
+        if self.repository.list_subgroups(group_id):
+            markup.row(
+                types.InlineKeyboardButton(
+                    "👤 Изменить подгруппу", callback_data="usr:subgroups"
+                )
+            )
+        markup.row(
+            types.InlineKeyboardButton(
+                "🗓 Открыть расписание", callback_data="usr:show"
+            )
+        )
+        if self.can_manage_group(group_id, user_id):
+            markup.row(
+                types.InlineKeyboardButton(
+                    "← Настройки группы", callback_data="cfg:home"
+                )
+            )
+        return markup
+
+    def send_user_settings_panel(self, chat_id: int, user_id: int) -> None:
+        group = self.repository.get_group(chat_id)
+        if group is None:
+            self.bot.send_message(chat_id, "Группа ещё не настроена.")
+            return
+        self.bot.send_message(
+            chat_id,
+            self.user_settings_text(group, user_id),
+            reply_markup=self.user_settings_keyboard(chat_id, user_id),
+        )
+
     def safe_edit(
         self,
         call: types.CallbackQuery,
@@ -565,6 +587,8 @@ class BotHandlers:
         try:
             if call.data.startswith("view:"):
                 self.handle_view_callback(call)
+            elif call.data.startswith("usr:"):
+                self.handle_user_settings_callback(call)
             elif call.data.startswith("adm:"):
                 self.handle_admin_callback(call)
             elif call.data.startswith("cfg:"):
@@ -591,42 +615,100 @@ class BotHandlers:
             raise CallbackNotice("Группа ещё не подключена.")
 
         raw_action = call.data.removeprefix("view:")
+        if raw_action == "home":
+            self.safe_edit(call, group.welcome_text, self.schedule_keyboard())
+            return
         if raw_action == "subgroups":
-            self.show_view_subgroups(call, group)
+            if self.repository.get_user_subgroup(group.chat_id, call.from_user.id):
+                raise CallbackNotice("Изменить подгруппу можно через /settings.")
+            self.show_view_subgroups(call, group, "today")
             return
         if raw_action.startswith("sub:"):
-            subgroup_value = raw_action.split(":", maxsplit=1)[1]
-            if subgroup_value == "common":
-                self.repository.clear_user_subgroup(group.chat_id, call.from_user.id)
-            elif not self.repository.set_user_subgroup(
+            if self.repository.get_user_subgroup(group.chat_id, call.from_user.id):
+                raise CallbackNotice("Изменить подгруппу можно через /settings.")
+            action_parts = raw_action.split(":", maxsplit=2)
+            subgroup_value = action_parts[1]
+            return_action = action_parts[2] if len(action_parts) == 3 else "today"
+            if not self.repository.set_user_subgroup(
                 group.chat_id, call.from_user.id, int(subgroup_value)
             ):
                 raise CallbackNotice("Подгруппа уже удалена.")
-            raw_action = "today"
+            raw_action = return_action
+
+        selected = self.repository.get_user_subgroup(group.chat_id, call.from_user.id)
+        subgroups = self.repository.list_subgroups(group.chat_id)
+        if selected is None and subgroups:
+            self.show_view_subgroups(call, group, raw_action)
+            return
 
         target_date = target_date_for_action(group, raw_action)
-        selected = self.repository.get_user_subgroup(group.chat_id, call.from_user.id)
         text = format_schedule(
             self.repository,
             group,
             target_date,
             selected.id if selected is not None else None,
         )
-        if selected is None and self.repository.list_subgroups(group.chat_id):
-            text += (
-                "\n\nℹ️ Сейчас показаны только общие занятия. Выберите свою подгруппу."
-            )
         self.safe_edit(
             call,
             text,
-            self.schedule_keyboard(
-                group.chat_id,
-                call.from_user.id,
-                self.can_manage_group(group.chat_id, call.from_user.id),
-            ),
+            self.schedule_keyboard(),
         )
 
-    def show_view_subgroups(self, call: types.CallbackQuery, group: Group) -> None:
+    def show_view_subgroups(
+        self, call: types.CallbackQuery, group: Group, return_action: str
+    ) -> None:
+        subgroups = self.repository.list_subgroups(group.chat_id)
+        if not subgroups:
+            raise CallbackNotice("В этой группе подгруппы не настроены.")
+        markup = types.InlineKeyboardMarkup()
+        for subgroup in subgroups:
+            markup.row(
+                types.InlineKeyboardButton(
+                    truncate(subgroup.name, 32),
+                    callback_data=f"view:sub:{subgroup.id}:{return_action}",
+                )
+            )
+        markup.row(types.InlineKeyboardButton("← Назад", callback_data="view:home"))
+        self.safe_edit(
+            call,
+            "Выберите свою подгруппу. Бот запомнит выбор; изменить его позже можно через /settings:",
+            markup,
+        )
+
+    def handle_user_settings_callback(self, call: types.CallbackQuery) -> None:
+        group_id = call.message.chat.id
+        if call.message.chat.type not in GROUP_CHAT_TYPES:
+            raise CallbackNotice("Личные настройки доступны только в группе.")
+        group = self.repository.get_group(group_id)
+        if group is None:
+            raise CallbackNotice("Группа не настроена.")
+
+        parts = call.data.split(":")
+        action = parts[1]
+        if action == "home":
+            self.safe_edit(
+                call,
+                self.user_settings_text(group, call.from_user.id),
+                self.user_settings_keyboard(group_id, call.from_user.id),
+            )
+        elif action == "subgroups":
+            self.show_user_subgroups(call, group)
+        elif action == "sub" and len(parts) == 3:
+            if not self.repository.set_user_subgroup(
+                group_id, call.from_user.id, int(parts[2])
+            ):
+                raise CallbackNotice("Подгруппа уже удалена.")
+            self.safe_edit(
+                call,
+                self.user_settings_text(group, call.from_user.id),
+                self.user_settings_keyboard(group_id, call.from_user.id),
+            )
+        elif action == "show":
+            self.safe_edit(call, group.welcome_text, self.schedule_keyboard())
+        else:
+            raise CallbackNotice("Кнопка устарела.", show_alert=False)
+
+    def show_user_subgroups(self, call: types.CallbackQuery, group: Group) -> None:
         subgroups = self.repository.list_subgroups(group.chat_id)
         if not subgroups:
             raise CallbackNotice("В этой группе подгруппы не настроены.")
@@ -637,16 +719,11 @@ class BotHandlers:
             markup.row(
                 types.InlineKeyboardButton(
                     f"{prefix}{truncate(subgroup.name, 32)}",
-                    callback_data=f"view:sub:{subgroup.id}",
+                    callback_data=f"usr:sub:{subgroup.id}",
                 )
             )
-        markup.row(
-            types.InlineKeyboardButton(
-                "Только общие занятия", callback_data="view:sub:common"
-            )
-        )
-        markup.row(types.InlineKeyboardButton("← Назад", callback_data="view:today"))
-        self.safe_edit(call, "Выберите свою подгруппу:", markup)
+        markup.row(types.InlineKeyboardButton("← Назад", callback_data="usr:home"))
+        self.safe_edit(call, "Выберите новую подгруппу:", markup)
 
     def handle_admin_callback(self, call: types.CallbackQuery) -> None:
         if call.message.chat.type != "private" or not self.is_global_owner(
@@ -731,11 +808,7 @@ class BotHandlers:
             self.safe_edit(
                 call,
                 group.welcome_text,
-                self.schedule_keyboard(
-                    group_id,
-                    call.from_user.id,
-                    self.can_manage_group(group_id, call.from_user.id),
-                ),
+                self.schedule_keyboard(),
             )
         elif action == "schedule":
             self.show_schedule_scopes(call)
