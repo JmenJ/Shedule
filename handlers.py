@@ -25,6 +25,7 @@ from schedule_service import (
 
 LOGGER = logging.getLogger(__name__)
 GROUP_CHAT_TYPES = {"group", "supergroup"}
+SCHEDULE_CHAT_TYPES = {*GROUP_CHAT_TYPES, "private"}
 LESSON_TIME_INPUT = re.compile(
     r"(?P<start>(?:[01]\d|2[0-3]):[0-5]\d)\s*[-–—]\s*"
     r"(?P<end>(?:[01]\d|2[0-3]):[0-5]\d)"
@@ -81,6 +82,12 @@ class CallbackNotice(Exception):
 def display_name(user: types.User) -> str:
     full_name = " ".join(part for part in (user.first_name, user.last_name) if part)
     return full_name or (f"@{user.username}" if user.username else str(user.id))
+
+
+def schedule_chat_title(message: types.Message) -> str:
+    if message.chat.type == "private":
+        return f"Личное расписание — {display_name(message.from_user)}"
+    return message.chat.title or str(message.chat.id)
 
 
 def truncate(value: str, limit: int = 36) -> str:
@@ -167,7 +174,7 @@ class BotHandlers:
         markup = types.InlineKeyboardMarkup()
         markup.row(
             types.InlineKeyboardButton(
-                "➕ Создать код подключения", callback_data="adm:new"
+                "➕ Создать код доступа", callback_data="adm:new"
             )
         )
         markup.row(
@@ -186,16 +193,29 @@ class BotHandlers:
 
     def start(self, message: types.Message) -> None:
         if message.chat.type == "private":
+            parts = (message.text or "").split(maxsplit=1)
+            if len(parts) == 2 and parts[1].startswith("setup_"):
+                self.activate_schedule(message, parts[1].removeprefix("setup_"))
+                return
+
+            group = self.repository.get_group(message.chat.id)
+            if group is not None:
+                self.bot.send_message(
+                    message.chat.id,
+                    group.welcome_text,
+                    reply_markup=self.schedule_keyboard(),
+                )
+                return
             if self.is_global_owner(message.from_user.id):
                 self.bot.send_message(
                     message.chat.id,
-                    "Панель владельца бота. Здесь создаются одноразовые коды для новых групп.",
+                    "Панель владельца бота. Здесь создаются одноразовые коды доступа к личному расписанию или новой группе.",
                     reply_markup=self.admin_keyboard(),
                 )
             else:
                 self.bot.send_message(
                     message.chat.id,
-                    "Добавьте меня в учебную группу. Участник с одноразовым кодом сможет подключить её командой /setup КОД и станет владельцем настроек.",
+                    "Чтобы пользоваться расписанием прямо здесь, получите одноразовый код доступа и отправьте /setup КОД. Позже это же расписание можно подключить к группе.",
                 )
             return
 
@@ -217,17 +237,18 @@ class BotHandlers:
         """Show instructions tailored to the current chat and the user's role."""
         user_id = message.from_user.id
 
-        if message.chat.type == "private":
+        group = self.repository.get_group(message.chat.id)
+        if message.chat.type == "private" and group is None:
             if self.is_global_owner(user_id):
                 self.bot.send_message(
                     message.chat.id,
                     "👑 Вы владелец бота.\n\n"
-                    "Как подключить новую учебную группу:\n"
+                    "Как выдать доступ человеку:\n"
                     "1. Откройте /admin.\n"
-                    "2. Создайте одноразовый код подключения.\n"
-                    "3. Передайте код будущему владельцу расписания.\n"
-                    "4. После добавления бота этот человек отправляет в группе /setup КОД.\n\n"
-                    "После подключения расписание и права настраиваются командой /settings внутри нужной группы.\n"
+                    "2. Создайте одноразовый код доступа.\n"
+                    "3. Передайте человеку код или персональную ссылку; код вводится в ЛС командой /setup КОД.\n"
+                    "4. Он активирует расписание прямо в ЛС с ботом.\n\n"
+                    "Позже владелец личного расписания создаёт код командой /copy и подключает группу.\n"
                     "Чтобы подключить ещё один чат к уже готовому расписанию, владелец группы создаёт код командой /copy.\n"
                     "Ваш Telegram ID можно посмотреть командой /myid.",
                     reply_markup=self.admin_keyboard(),
@@ -235,13 +256,11 @@ class BotHandlers:
             else:
                 self.bot.send_message(
                     message.chat.id,
-                    "📚 Этот бот показывает расписание отдельно для каждой учебной группы.\n\n"
-                    "Добавьте бота в нужную Telegram-группу или откройте уже подключённую группу и отправьте там /help. "
-                    "Если у вас есть одноразовый код, отправьте в новой группе /setup КОД — вы станете владельцем её настроек.",
+                    "📚 Ботом можно пользоваться прямо в личном чате.\n\n"
+                    "Получите одноразовый код доступа и отправьте /setup КОД. Вы получите личное расписание, которое позже можно подключить к Telegram-группе командой /copy.",
                 )
             return
 
-        group = self.repository.get_group(message.chat.id)
         if group is None:
             text = (
                 "🛠 Эта группа ещё не подключена.\n\n"
@@ -270,7 +289,11 @@ class BotHandlers:
         if self.can_manage_group(message.chat.id, user_id):
             role_label = "модератор расписания"
             if role == "owner":
-                role_label = "владелец настроек группы"
+                role_label = (
+                    "владелец личного расписания"
+                    if message.chat.type == "private"
+                    else "владелец настроек группы"
+                )
             elif self.is_global_owner(user_id):
                 role_label = "владелец бота"
             lines.extend(
@@ -284,16 +307,25 @@ class BotHandlers:
             )
 
         if self.can_manage_moderators(message.chat.id, user_id):
-            lines.extend(
-                [
-                    "",
-                    "👥 Управление доступом:",
-                    "• /mods — список владельца и модераторов;",
-                    "• ответьте на сообщение человека командой /mod_add или /mod_remove;",
-                    "• передача владения находится в /settings → «Модераторы».",
-                    "• /copy — создать одноразовый код для подключения ещё одного чата к этому же расписанию.",
-                ]
-            )
+            if message.chat.type == "private":
+                lines.extend(
+                    [
+                        "",
+                        "🔗 Подключение группы:",
+                        "• /copy — создать одноразовый код, затем добавить бота в группу и отправить там /copy КОД.",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "",
+                        "👥 Управление доступом:",
+                        "• /mods — список владельца и модераторов;",
+                        "• ответьте на сообщение человека командой /mod_add или /mod_remove;",
+                        "• передача владения находится в /settings → «Модераторы».",
+                        "• /copy — создать одноразовый код для подключения ещё одного чата к этому же расписанию.",
+                    ]
+                )
 
         self.bot.send_message(
             message.chat.id,
@@ -319,9 +351,9 @@ class BotHandlers:
         )
 
     def setup_group(self, message: types.Message) -> None:
-        if message.chat.type not in GROUP_CHAT_TYPES:
+        if message.chat.type not in SCHEDULE_CHAT_TYPES:
             self.bot.reply_to(
-                message, "Команда /setup используется внутри Telegram-группы."
+                message, "Команда /setup используется в личном чате или Telegram-группе."
             )
             return
 
@@ -330,13 +362,16 @@ class BotHandlers:
             self.bot.reply_to(message, "Использование: /setup КОД")
             return
 
+        self.activate_schedule(message, parts[1])
+
+    def activate_schedule(self, message: types.Message, code: str) -> None:
         timezone = ZoneInfo(self.settings.default_timezone)
         today = datetime.now(timezone).date()
         anchor_week = "upper" if today.isocalendar().week % 2 == 1 else "lower"
         result = self.repository.consume_setup_code(
-            code=parts[1],
+            code=code,
             group_id=message.chat.id,
-            group_title=message.chat.title or str(message.chat.id),
+            group_title=schedule_chat_title(message),
             user_id=message.from_user.id,
             display_name=display_name(message.from_user),
             timezone=self.settings.default_timezone,
@@ -357,22 +392,27 @@ class BotHandlers:
                 LOGGER.exception("Не удалось импортировать начальное расписание")
                 self.bot.reply_to(
                     message,
-                    "Группа подключена, но шаблон расписания не импортировался. Его можно заполнить через /settings.",
+                    "Расписание подключено, но шаблон не импортировался. Его можно заполнить через /settings.",
                 )
                 return
 
+        is_private = message.chat.type == "private"
         self.bot.reply_to(
             message,
-            "Группа подключена ✅\n"
-            "Вы назначены владельцем настроек этой группы. Откройте /settings, чтобы заполнить расписание и добавить модераторов.",
-            reply_markup=self.settings_keyboard(),
+            (
+                "Личное расписание активировано ✅\n"
+                "Пользуйтесь командами /start и /settings. Когда захотите добавить группу, создайте код командой /copy."
+                if is_private
+                else "Группа подключена ✅\nВы назначены владельцем настроек этой группы. Откройте /settings, чтобы заполнить расписание и добавить модераторов."
+            ),
+            reply_markup=self.settings_keyboard(personal_chat=is_private),
         )
 
     def copy_group(self, message: types.Message) -> None:
-        if message.chat.type not in GROUP_CHAT_TYPES:
+        if message.chat.type not in SCHEDULE_CHAT_TYPES:
             self.bot.reply_to(
                 message,
-                "Команда /copy используется внутри Telegram-группы.",
+                "Команда /copy используется в личном чате или Telegram-группе.",
             )
             return
 
@@ -389,7 +429,7 @@ class BotHandlers:
             result = self.repository.consume_group_copy_code(
                 code=parts[1],
                 target_group_id=message.chat.id,
-                target_group_title=message.chat.title or str(message.chat.id),
+                target_group_title=schedule_chat_title(message),
                 used_by=message.from_user.id,
             )
             if not result.ok:
@@ -397,7 +437,7 @@ class BotHandlers:
                 return
             self.bot.reply_to(
                 message,
-                "Группа подключена к общему расписанию ✅\n\n"
+                "Чат подключён к общему расписанию ✅\n\n"
                 "Расписание, настройки, владелец и модераторы теперь общие с исходной группой. "
                 "Изменения из любого подключённого чата сразу действуют во всех.",
                 reply_markup=self.schedule_keyboard(),
@@ -432,9 +472,9 @@ class BotHandlers:
         )
 
     def settings_menu(self, message: types.Message) -> None:
-        if message.chat.type not in GROUP_CHAT_TYPES:
+        if message.chat.type not in SCHEDULE_CHAT_TYPES:
             self.bot.reply_to(
-                message, "Настройки группы открываются командой /settings внутри неё."
+                message, "Настройки открываются в личном чате или Telegram-группе."
             )
             return
         group = self.repository.get_group(message.chat.id)
@@ -442,7 +482,9 @@ class BotHandlers:
             self.bot.reply_to(message, "Группа ещё не настроена.")
             return
         if self.can_manage_group(message.chat.id, message.from_user.id):
-            self.send_settings_panel(message.chat.id)
+            self.send_settings_panel(
+                message.chat.id, personal_chat=message.chat.type == "private"
+            )
         else:
             self.send_user_settings_panel(message.chat.id, message.from_user.id)
 
@@ -451,7 +493,7 @@ class BotHandlers:
         self.bot.reply_to(message, "Ввод отменён.")
 
     @staticmethod
-    def settings_keyboard() -> types.InlineKeyboardMarkup:
+    def settings_keyboard(personal_chat: bool = False) -> types.InlineKeyboardMarkup:
         markup = types.InlineKeyboardMarkup()
         markup.row(
             types.InlineKeyboardButton(
@@ -479,7 +521,16 @@ class BotHandlers:
             ),
             types.InlineKeyboardButton("👥 Подгруппы", callback_data="cfg:subs"),
         )
-        markup.row(types.InlineKeyboardButton("🛡 Модераторы", callback_data="cfg:mods"))
+        if personal_chat:
+            markup.row(
+                types.InlineKeyboardButton(
+                    "🔗 Подключить группу", callback_data="cfg:link"
+                )
+            )
+        else:
+            markup.row(
+                types.InlineKeyboardButton("🛡 Модераторы", callback_data="cfg:mods")
+            )
         markup.row(
             types.InlineKeyboardButton(
                 "👤 Моя подгруппа", callback_data="usr:home"
@@ -513,13 +564,15 @@ class BotHandlers:
             "Расписание, настройки и права общие для всех объединённых чатов."
         )
 
-    def send_settings_panel(self, chat_id: int) -> None:
+    def send_settings_panel(self, chat_id: int, personal_chat: bool = False) -> None:
         group = self.repository.get_group(chat_id)
         if group is None:
             self.bot.send_message(chat_id, "Группа ещё не настроена.")
             return
         self.bot.send_message(
-            chat_id, self.settings_text(group), reply_markup=self.settings_keyboard()
+            chat_id,
+            self.settings_text(group),
+            reply_markup=self.settings_keyboard(personal_chat=personal_chat),
         )
 
     def user_settings_text(self, group: Group, user_id: int) -> str:
@@ -677,8 +730,8 @@ class BotHandlers:
 
     def handle_user_settings_callback(self, call: types.CallbackQuery) -> None:
         group_id = call.message.chat.id
-        if call.message.chat.type not in GROUP_CHAT_TYPES:
-            raise CallbackNotice("Личные настройки доступны только в группе.")
+        if call.message.chat.type not in SCHEDULE_CHAT_TYPES:
+            raise CallbackNotice("Личные настройки здесь недоступны.")
         group = self.repository.get_group(group_id)
         if group is None:
             raise CallbackNotice("Группа не настроена.")
@@ -749,7 +802,7 @@ class BotHandlers:
             markup.row(types.InlineKeyboardButton("← Назад", callback_data="adm:home"))
             self.safe_edit(
                 call,
-                "Какое расписание создать в новой группе? Его можно полностью изменить после подключения.",
+                "Какое расписание выдать новому пользователю? Он сможет активировать его в ЛС или сразу в группе.",
                 markup,
             )
         elif action[1] == "code" and len(action) == 3:
@@ -758,11 +811,23 @@ class BotHandlers:
                 template_key=action[2],
                 ttl_hours=self.settings.setup_code_ttl_hours,
             )
+            invite_link = None
+            try:
+                username = self.bot.get_me().username
+                if username:
+                    invite_link = f"https://t.me/{username}?start=setup_{code}"
+            except Exception:
+                LOGGER.warning("Не удалось получить username бота для ссылки доступа")
             text = (
-                f"Код подключения: {code}\n\n"
+                f"Код доступа: {code}\n\n"
                 f"Действует {self.settings.setup_code_ttl_hours} ч. и используется один раз.\n"
-                "Передайте его будущему владельцу расписания. После добавления бота он должен выполнить в группе:\n\n"
+                "Передайте его будущему владельцу расписания. Он может открыть ссылку или отправить боту в ЛС:\n\n"
                 f"/setup {code}"
+            )
+            if invite_link:
+                text += f"\n\nПерсональная ссылка:\n{invite_link}"
+            text += (
+                "\n\nПосле активации расписание работает в ЛС. Подключить к нему группу можно позже командой /copy."
             )
             self.safe_edit(call, text, self.back_button("adm:home"))
         elif action[1] == "groups":
@@ -791,24 +856,47 @@ class BotHandlers:
 
     def handle_settings_callback(self, call: types.CallbackQuery) -> None:
         group_id = call.message.chat.id
-        if call.message.chat.type not in GROUP_CHAT_TYPES:
-            raise CallbackNotice("Настройки доступны только в группе.")
+        if call.message.chat.type not in SCHEDULE_CHAT_TYPES:
+            raise CallbackNotice("Настройки здесь недоступны.")
         if not self.can_manage_group(group_id, call.from_user.id):
-            raise CallbackNotice("Нет прав на изменение этой группы.")
+            raise CallbackNotice("Нет прав на изменение этого расписания.")
 
         parts = call.data.split(":")
         action = parts[1]
+        personal_chat = call.message.chat.type == "private"
         group = self.repository.get_group(group_id)
         if group is None:
             raise CallbackNotice("Группа не настроена.")
 
         if action == "home":
-            self.safe_edit(call, self.settings_text(group), self.settings_keyboard())
+            self.safe_edit(
+                call,
+                self.settings_text(group),
+                self.settings_keyboard(personal_chat=personal_chat),
+            )
         elif action == "show":
             self.safe_edit(
                 call,
                 group.welcome_text,
                 self.schedule_keyboard(),
+            )
+        elif action == "link":
+            if not personal_chat or not self.can_manage_moderators(
+                group_id, call.from_user.id
+            ):
+                raise CallbackNotice("Только владелец может подключать группу.")
+            code = self.repository.create_group_copy_code(
+                group_id=group_id,
+                created_by=call.from_user.id,
+                ttl_hours=self.settings.setup_code_ttl_hours,
+            )
+            self.safe_edit(
+                call,
+                f"Код подключения группы: {code}\n\n"
+                f"Он действует {self.settings.setup_code_ttl_hours} ч. и используется один раз.\n"
+                "Добавьте бота в новую группу и отправьте там:\n\n"
+                f"/copy {code}",
+                self.back_button("cfg:home"),
             )
         elif action == "schedule":
             self.show_schedule_scopes(call)
@@ -940,7 +1028,11 @@ class BotHandlers:
                 )
                 or group
             )
-            self.safe_edit(call, self.settings_text(group), self.settings_keyboard())
+            self.safe_edit(
+                call,
+                self.settings_text(group),
+                self.settings_keyboard(personal_chat=personal_chat),
+            )
         elif action == "timezone":
             self.begin_text_input(
                 call,
@@ -1293,7 +1385,9 @@ class BotHandlers:
             )
             return
 
-        result_markup = self.settings_keyboard()
+        result_markup = self.settings_keyboard(
+            personal_chat=message.chat.type == "private"
+        )
         try:
             if state.action == "add_entry":
                 if len(value) > 300:

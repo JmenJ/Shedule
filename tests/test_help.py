@@ -28,6 +28,9 @@ class FakeBot:
     def answer_callback_query(self, callback_id, *args, **kwargs):
         return None
 
+    def get_me(self):
+        return SimpleNamespace(username="test_schedule_bot")
+
 
 class FakeRepository:
     def __init__(self, group=None, roles=None, subgroups=None):
@@ -68,6 +71,12 @@ class FakeRepository:
 
     def list_lesson_times(self, group_id):
         return []
+
+    def get_notification_settings(self, group_id):
+        return SimpleNamespace(enabled=False, notification_time="07:30")
+
+    def list_linked_groups(self, group_id):
+        return [self.group] if self.group is not None else []
 
     def consume_setup_code(self, **kwargs):
         self.consumed_setup = kwargs
@@ -111,9 +120,9 @@ def make_settings(owner_ids=frozenset({999})):
     )
 
 
-def make_group():
+def make_group(chat_id=-1001):
     return SimpleNamespace(
-        chat_id=-1001,
+        chat_id=chat_id,
         title="ИКБО-01",
         timezone="Europe/Moscow",
         anchor_monday=date(2026, 8, 31),
@@ -169,6 +178,66 @@ class HelpCommandTests(TestCase):
         self.assertEqual(repository.consumed_setup["code"], "VALIDCODE")
         self.assertEqual(bot.chat_member_checks, 0)
         self.assertIn("Вы назначены владельцем", bot.messages[-1][1])
+
+    def test_user_activates_personal_schedule_in_private_chat(self):
+        bot = FakeBot()
+        repository = FakeRepository()
+        handlers = BotHandlers(bot, repository, make_settings())
+
+        handlers.setup_group(
+            make_message("private", user_id=321, text="/setup VALIDCODE")
+        )
+
+        self.assertEqual(repository.consumed_setup["group_id"], 321)
+        self.assertEqual(repository.consumed_setup["user_id"], 321)
+        self.assertIn("Личное расписание", repository.consumed_setup["group_title"])
+        self.assertIn("активировано", bot.messages[-1][1])
+
+    def test_private_invite_link_activates_schedule(self):
+        bot = FakeBot()
+        repository = FakeRepository()
+        handlers = BotHandlers(bot, repository, make_settings())
+
+        handlers.start(
+            make_message("private", user_id=321, text="/start setup_VALIDCODE")
+        )
+
+        self.assertEqual(repository.consumed_setup["code"], "VALIDCODE")
+
+    def test_configured_personal_schedule_opens_on_start(self):
+        bot = FakeBot()
+        group = make_group(chat_id=321)
+        handlers = BotHandlers(
+            bot, FakeRepository(group, roles={321: "owner"}), make_settings()
+        )
+
+        handlers.start(make_message("private", user_id=321, text="/start"))
+
+        self.assertEqual(bot.messages[-1][1], group.welcome_text)
+
+    def test_personal_schedule_owner_can_create_group_copy_code(self):
+        bot = FakeBot()
+        group = make_group(chat_id=321)
+        repository = FakeRepository(group, roles={321: "owner"})
+        handlers = BotHandlers(bot, repository, make_settings())
+
+        handlers.copy_group(make_message("private", user_id=321, text="/copy"))
+
+        self.assertEqual(repository.created_copy["group_id"], 321)
+        self.assertIn("/copy COPYCODE12", bot.messages[-1][1])
+
+    def test_personal_settings_offer_group_link_without_moderator_controls(self):
+        bot = FakeBot()
+        group = make_group(chat_id=321)
+        repository = FakeRepository(group, roles={321: "owner"})
+        handlers = BotHandlers(bot, repository, make_settings())
+
+        handlers.settings_menu(make_message("private", user_id=321))
+
+        markup = bot.messages[-1][2]["reply_markup"]
+        labels = [button.text for row in markup.keyboard for button in row]
+        self.assertIn("🔗 Подключить группу", labels)
+        self.assertNotIn("🛡 Модераторы", labels)
 
     def test_participant_does_not_see_management_commands(self):
         bot = FakeBot()

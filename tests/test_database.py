@@ -302,6 +302,35 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.repository.list_subgroups(-1001)[0].name, "Подгруппа А")
         self.assertEqual(len(self.repository.list_linked_groups(-1002)), 2)
 
+    def test_personal_schedule_can_be_linked_to_group_later(self):
+        setup_code = self.repository.create_setup_code(999, "blank", 24)
+        result = self.repository.consume_setup_code(
+            code=setup_code,
+            group_id=100,
+            group_title="Личное расписание",
+            user_id=100,
+            display_name="Владелец",
+            timezone="Europe/Moscow",
+            anchor_monday=date(2026, 8, 31),
+            anchor_week_type="upper",
+        )
+        self.assertTrue(result.ok)
+        self.repository.add_schedule_entry(100, "upper", 0, "Математика")
+
+        copy_code = self.repository.create_group_copy_code(100, 100, 24)
+        linked = self.repository.consume_group_copy_code(
+            copy_code, -1001, "Учебная группа", 100
+        )
+
+        self.assertTrue(linked.ok)
+        self.assertEqual(self.repository.resolve_group_id(-1001), 100)
+        self.assertEqual(self.repository.get_role(-1001, 100), "owner")
+        self.assertEqual(
+            [entry.text for entry in self.repository.list_schedule(-1001, "upper", 0)],
+            ["Математика"],
+        )
+        self.assertEqual(len(self.repository.list_linked_groups(100)), 2)
+
     def test_copy_code_is_single_use_and_cannot_replace_configured_group(self):
         for group_id in (-1001, -1003):
             setup_code = self.repository.create_setup_code(100, "blank", 24)
