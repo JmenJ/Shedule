@@ -49,22 +49,38 @@ class ScheduleServiceTests(unittest.TestCase):
         )
 
     def test_format_schedule_uses_group_entries(self):
+        self.repository.set_lesson_time(-1001, 1, "08:00", "09:30")
         self.repository.add_schedule_entry(
             -1001, "upper", 0, "1. Математика 08:00–09:30"
         )
         text = format_schedule(self.repository, self.group, date(2026, 8, 31))
         self.assertIn("Верхняя неделя", text)
-        self.assertIn("1. Математика", text)
+        self.assertIn("1. 08:00–09:30 — Математика", text)
         self.assertNotIn("1. 1. Математика", text)
 
+    def test_unconfigured_lesson_time_does_not_add_placeholder(self):
+        self.repository.add_schedule_entry(-1001, "upper", 0, "Математика")
+
+        text = format_schedule(self.repository, self.group, date(2026, 8, 31))
+
+        self.assertIn("1. Математика", text)
+        self.assertNotIn("не задано", text)
+
     def test_moving_entries_updates_display_numbers(self):
+        self.repository.set_lesson_times(
+            -1001,
+            {1: ("08:00", "09:30"), 2: ("09:40", "11:10")},
+        )
         self.repository.add_schedule_entry(-1001, "upper", 0, "Первая")
         second = self.repository.add_schedule_entry(-1001, "upper", 0, "Вторая")
 
         self.repository.move_schedule_entry(-1001, second.id, "up")
         text = format_schedule(self.repository, self.group, date(2026, 8, 31))
 
-        self.assertLess(text.index("1. Вторая"), text.index("2. Первая"))
+        self.assertLess(
+            text.index("1. 08:00–09:30 — Вторая"),
+            text.index("2. 09:40–11:10 — Первая"),
+        )
 
     def test_subgroup_schedule_includes_common_and_personal_entries(self):
         subgroup = self.repository.add_subgroup(-1001, "Подгруппа 1")

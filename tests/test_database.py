@@ -152,6 +152,104 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual([entry.text for entry in entries], ["Вторая", "Первая"])
         self.assertEqual(first.position, 1)
 
+    def test_lesson_times_are_shared_by_linked_chats(self):
+        setup_code = self.repository.create_setup_code(100, "blank", 24)
+        self.assertTrue(self.connect_group(-1001, setup_code).ok)
+        copy_code = self.repository.create_group_copy_code(-1001, 100, 24)
+        self.assertTrue(
+            self.repository.consume_group_copy_code(
+                copy_code, -1002, "Второй чат", 200
+            ).ok
+        )
+
+        self.repository.set_lesson_time(-1002, 1, "08:00", "09:30")
+
+        source_times = self.repository.list_lesson_times(-1001)
+        linked_times = self.repository.list_lesson_times(-1002)
+        self.assertEqual(
+            [(item.lesson_number, item.start_time, item.end_time) for item in source_times],
+            [(1, "08:00", "09:30")],
+        )
+        self.assertEqual(
+            [(item.lesson_number, item.start_time, item.end_time) for item in linked_times],
+            [(1, "08:00", "09:30")],
+        )
+
+    def test_template_import_extracts_shared_times_from_legacy_text(self):
+        code = self.repository.create_setup_code(100, "blank", 24)
+        self.assertTrue(self.connect_group(-1001, code).ok)
+
+        self.repository.replace_schedule_from_template(
+            -1001,
+            {
+                "upper": {
+                    "0": [
+                        "1. Математика, ауд. 204 08:00-09:30",
+                        "2. Физика 09:40–11:10",
+                    ]
+                }
+            },
+        )
+
+        entries = self.repository.list_schedule(-1001, "upper", 0)
+        times = self.repository.list_lesson_times(-1001)
+        self.assertEqual(
+            [entry.text for entry in entries],
+            ["Математика, ауд. 204", "Физика"],
+        )
+        self.assertEqual(
+            [
+                (item.lesson_number, item.start_time, item.end_time)
+                for item in times
+            ],
+            [(1, "08:00", "09:30"), (2, "09:40", "11:10")],
+        )
+
+    def test_legacy_migration_extracts_times_before_normalizing_entries(self):
+        code = self.repository.create_setup_code(100, "blank", 24)
+        self.assertTrue(self.connect_group(-1001, code).ok)
+        with self.repository.Session.begin() as session:
+            session.add_all(
+                [
+                    ScheduleEntry(
+                        group_id=-1001,
+                        week_type="upper",
+                        day_of_week=0,
+                        position=1,
+                        text="Математика 08:00-09:30",
+                    ),
+                    ScheduleEntry(
+                        group_id=-1001,
+                        week_type="lower",
+                        day_of_week=1,
+                        position=1,
+                        text="Физика 08:00–09:30",
+                    ),
+                ]
+            )
+
+        self.assertEqual(self.repository.migrate_legacy_lesson_times(), 1)
+        self.repository.normalize_existing_schedule_entries()
+
+        times = self.repository.list_lesson_times(-1001)
+        upper = self.repository.list_schedule(-1001, "upper", 0)
+        lower = self.repository.list_schedule(-1001, "lower", 1)
+        self.assertEqual(
+            [(item.lesson_number, item.start_time, item.end_time) for item in times],
+            [(1, "08:00", "09:30")],
+        )
+        self.assertEqual([entry.text for entry in upper], ["Математика"])
+        self.assertEqual([entry.text for entry in lower], ["Физика"])
+
+    def test_lesson_time_validation_rejects_invalid_ranges(self):
+        code = self.repository.create_setup_code(100, "blank", 24)
+        self.assertTrue(self.connect_group(-1001, code).ok)
+
+        with self.assertRaisesRegex(ValueError, "позже"):
+            self.repository.set_lesson_time(-1001, 1, "10:00", "09:00")
+        with self.assertRaisesRegex(ValueError, "от 1 до 8"):
+            self.repository.set_lesson_time(-1001, 9, "10:00", "11:00")
+
     def test_notification_settings_and_delivery_claim(self):
         code = self.repository.create_setup_code(100, "blank", 24)
         self.assertTrue(self.connect_group(-1001, code).ok)
