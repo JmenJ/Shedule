@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest import TestCase
+from datetime import date
 
 from config import Settings
 from handlers import BotHandlers, parse_lesson_time_range, parse_lesson_times_bulk
@@ -21,11 +22,19 @@ class FakeBot:
         self.chat_member_checks += 1
         return SimpleNamespace(status=self.telegram_status)
 
+    def edit_message_text(self, text, **kwargs):
+        self.messages.append((kwargs["chat_id"], text, kwargs))
+
+    def answer_callback_query(self, callback_id, *args, **kwargs):
+        return None
+
 
 class FakeRepository:
-    def __init__(self, group=None, roles=None):
+    def __init__(self, group=None, roles=None, subgroups=None):
         self.group = group
         self.roles = roles or {}
+        self.subgroups = subgroups or []
+        self.user_subgroups = {}
         self.consumed_setup = None
         self.created_copy = None
         self.consumed_copy = None
@@ -37,6 +46,27 @@ class FakeRepository:
         return self.roles.get(user_id)
 
     def list_subgroups(self, group_id):
+        return self.subgroups
+
+    def get_user_subgroup(self, group_id, user_id):
+        subgroup_id = self.user_subgroups.get(user_id)
+        return next(
+            (item for item in self.subgroups if item.id == subgroup_id), None
+        )
+
+    def get_subgroup(self, group_id, subgroup_id):
+        return next((item for item in self.subgroups if item.id == subgroup_id), None)
+
+    def set_user_subgroup(self, group_id, user_id, subgroup_id):
+        if not any(item.id == subgroup_id for item in self.subgroups):
+            return False
+        self.user_subgroups[user_id] = subgroup_id
+        return True
+
+    def list_schedule(self, group_id, week_type, day_of_week, subgroup_id=None):
+        return []
+
+    def list_lesson_times(self, group_id):
         return []
 
     def consume_setup_code(self, **kwargs):
@@ -78,6 +108,30 @@ def make_settings(owner_ids=frozenset({999})):
         webhook_secret=None,
         default_timezone="Europe/Moscow",
         setup_code_ttl_hours=24,
+    )
+
+
+def make_group():
+    return SimpleNamespace(
+        chat_id=-1001,
+        title="ИКБО-01",
+        timezone="Europe/Moscow",
+        anchor_monday=date(2026, 8, 31),
+        anchor_week_type="upper",
+        welcome_text="Выберите день",
+        empty_day_text="Пар нет",
+    )
+
+
+def make_callback(data, user_id=100):
+    return SimpleNamespace(
+        id="callback-1",
+        data=data,
+        from_user=SimpleNamespace(id=user_id),
+        message=SimpleNamespace(
+            message_id=10,
+            chat=SimpleNamespace(id=-1001, type="supergroup"),
+        ),
     )
 
 
@@ -124,8 +178,8 @@ class HelpCommandTests(TestCase):
         handlers.help_command(make_message("supergroup"))
 
         text = bot.messages[-1][1]
-        self.assertIn("Выбрать подгруппу", text)
-        self.assertNotIn("/settings", text)
+        self.assertIn("один раз попросит указать подгруппу", text)
+        self.assertIn("/settings", text)
         self.assertNotIn("/mods", text)
 
     def test_moderator_sees_editing_but_not_access_management(self):
@@ -174,6 +228,53 @@ class HelpCommandTests(TestCase):
 
         self.assertIsNone(repository.created_copy)
         self.assertIn("только владелец", bot.messages[-1][1])
+
+    def test_first_schedule_view_requests_subgroup_once(self):
+        bot = FakeBot()
+        subgroups = [
+            SimpleNamespace(id=1, name="Подгруппа 1"),
+            SimpleNamespace(id=2, name="Подгруппа 2"),
+        ]
+        repository = FakeRepository(make_group(), subgroups=subgroups)
+        handlers = BotHandlers(bot, repository, make_settings())
+
+        handlers.handle_view_callback(make_callback("view:tomorrow"))
+
+        text = bot.messages[-1][1]
+        markup = bot.messages[-1][2]["reply_markup"]
+        callbacks = [button.callback_data for row in markup.keyboard for button in row]
+        self.assertIn("Бот запомнит выбор", text)
+        self.assertIn("view:sub:1:tomorrow", callbacks)
+        self.assertNotIn(100, repository.user_subgroups)
+
+    def test_subgroup_is_saved_and_schedule_keyboard_has_no_edit_button(self):
+        bot = FakeBot()
+        subgroups = [SimpleNamespace(id=1, name="Подгруппа 1")]
+        repository = FakeRepository(make_group(), subgroups=subgroups)
+        handlers = BotHandlers(bot, repository, make_settings())
+
+        handlers.handle_view_callback(make_callback("view:sub:1:today"))
+
+        self.assertEqual(repository.user_subgroups[100], 1)
+        markup = bot.messages[-1][2]["reply_markup"]
+        labels = [button.text for row in markup.keyboard for button in row]
+        self.assertFalse(any("подгруп" in label.lower() for label in labels))
+        self.assertFalse(any("настрой" in label.lower() for label in labels))
+
+    def test_participant_changes_subgroup_in_personal_settings(self):
+        bot = FakeBot()
+        subgroups = [SimpleNamespace(id=1, name="Подгруппа 1")]
+        repository = FakeRepository(make_group(), subgroups=subgroups)
+        handlers = BotHandlers(bot, repository, make_settings())
+
+        handlers.settings_menu(make_message("supergroup"))
+
+        text = bot.messages[-1][1]
+        markup = bot.messages[-1][2]["reply_markup"]
+        labels = [button.text for row in markup.keyboard for button in row]
+        self.assertIn("Личные настройки", text)
+        self.assertIn("👤 Изменить подгруппу", labels)
+        self.assertNotIn("📚 Редактировать расписание", labels)
 
 
 class LessonTimeInputTests(TestCase):
