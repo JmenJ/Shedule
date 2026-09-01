@@ -25,10 +25,10 @@ def format_lesson_line(
 ) -> str:
     configured_time = lesson_times.get(lesson_number)
     if configured_time is None:
-        return f"{lesson_number}. {text}"
+        return text
     return (
-        f"{lesson_number}. {configured_time.start_time}–"
-        f"{configured_time.end_time} — {text}"
+        f"{configured_time.start_time}–"
+        f"{configured_time.end_time}: {text}"
     )
 
 

@@ -1144,7 +1144,7 @@ class BotHandlers:
         for index, entry in enumerate(entries, start=1):
             markup.row(
                 types.InlineKeyboardButton(
-                    f"✏️ {index}. {truncate(entry.text)}",
+                    f"✏️ {truncate(entry.text)}",
                     callback_data=f"cfg:edit:{entry.id}",
                 ),
                 types.InlineKeyboardButton(
