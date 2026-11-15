@@ -55,8 +55,8 @@ class MessageTests(TestCase):
             {"type": "poll", "poll": {"question": "Выбор?"}},
         ])
         parts = plan_message(item, PEER, "@thelovelesss")
-        self.assertEqual([p.kind for p in parts], ["text", "text", "photo", "document", "text"])
-        self.assertTrue(parts[2].url.endswith("/l.jpg"))
+        self.assertEqual([p.kind for p in parts], ["text", "photo", "document", "text"])
+        self.assertTrue(parts[1].url.endswith("/l.jpg"))
         self.assertIn("@thelovelesss", parts[-1].text)
         self.assertIn("poll", parts[-1].text)
         self.assertIn("Требуется ручная проверка", parts[-1].text)
@@ -153,11 +153,10 @@ class DeliveryTests(TestCase):
             delivery.test_message(message(99))
         self.assertEqual(self.store.state()[1], 1)
         self.assertEqual(self.store.pending(), [])
-        self.assertIn("Тест", bot.sent[0])
-        self.assertIn("Message 99", bot.sent)
+        self.assertEqual(bot.sent, ["Message 99"])
     def test_resume_does_not_repeat_completed_parts(self):
         self.store.observe([message(1)])
-        self.store.observe([message(2, text="body")])
+        self.store.observe([message(2, text="A" * 3500 + "body")])
         bot = FakeBot()
         bot.fail_text = "body"
         delivery = Delivery(bot, self.store, -100, PEER, "@thelovelesss", 1024)
@@ -338,7 +337,7 @@ class BrowserLoopTests(TestCase):
         self.assertIn("Message 2", bot.sent)
         self.assertEqual(bot.sent.count("Message 1"), 1)
         self.assertEqual(bot.sent.count("Message 2"), 1)
-        self.assertTrue(any("Тест:" in text for text in bot.sent))
+        self.assertFalse(any("Тест:" in text or "ВК · отправитель" in text or "Чтение ВК подключено" in text for text in bot.sent))
         self.assertEqual(relay.store.state()[1], 2)
         if storage == "postgres": self.assertIsNotNone(self.store.load_session())
         else:
