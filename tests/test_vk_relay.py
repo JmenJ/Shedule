@@ -276,6 +276,7 @@ class BrowserLoopTests(TestCase):
 
         class Response:
             url = "https://api.vk.ru/method/messages.getHistory"
+            status = 200
             headers = {}
             request = SimpleNamespace(resource_type="fetch", post_data=f"peer_id={PEER}")
             def __init__(self, items): self.items = items
@@ -283,6 +284,7 @@ class BrowserLoopTests(TestCase):
                 return json.dumps({"response": {"items": self.items}}).encode()
 
         class Page:
+            url = "https://vk.ru/im/convo/2000000012"
             def on(self, event, handler): self.handler = handler
             async def goto(self, *args, **kwargs): self.handler(Response([message(1)]))
             async def reload(self, **kwargs): self.handler(Response([message(1), message(2)]))
