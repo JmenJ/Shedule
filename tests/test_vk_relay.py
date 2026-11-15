@@ -302,6 +302,7 @@ class BrowserLoopTests(TestCase):
 
         class Context:
             async def route(self, *args): pass
+            async def cookies(self): return [{"name": "auth", "value": "rotated"}]
             async def new_page(self): return Page()
             async def storage_state(self, **kwargs):
                 if storage == "memory": raise AssertionError("Memory mode must not export caches")
@@ -340,7 +341,9 @@ class BrowserLoopTests(TestCase):
         self.assertTrue(any("Тест:" in text for text in bot.sent))
         self.assertEqual(relay.store.state()[1], 2)
         if storage == "postgres": self.assertIsNotNone(self.store.load_session())
-        else: self.assertEqual(len(closed), 2)
+        else:
+            self.assertEqual(len(closed), 2)
+            self.assertEqual(relay.store.load_session()["cookies"][0]["value"], "rotated")
 
     def test_test_request_is_coalesced_and_failure_releases_it(self):
         relay = VkRelay(FakeBot(), RelaySettings(-100, PEER, "@thelovelesss", self.url, "unused"))
