@@ -12,7 +12,8 @@ from pathlib import Path
 from urllib.parse import unquote_plus, urlsplit
 
 from .delivery import Delivery
-from .messages import extract_messages, parse_payload, request_peer, source_link
+from .messages import extract_messages, message_number, parse_payload, request_peer, source_link
+from .session import compact_session
 from .store import Store
 
 
@@ -70,6 +71,31 @@ class VkRelay:
         self.status = "starting"
         self.alert_times: dict[str, float] = {}
         self.force_reset = os.getenv("VK_SESSION_RESET", "0") == "1"
+        self.test_lock = threading.Lock()
+        self.test_reply_chat = None
+        self.test_event = threading.Event()
+
+    def request_test(self, reply_chat: int) -> bool:
+        with self.test_lock:
+            if self.test_reply_chat is not None:
+                return False
+            self.test_reply_chat = reply_chat
+            self.test_event.set()
+            return True
+
+    def finish_test(self, success: bool):
+        with self.test_lock:
+            reply_chat = self.test_reply_chat
+            self.test_reply_chat = None
+            self.test_event.clear()
+        if reply_chat is None or (success and reply_chat == self.settings.target_chat):
+            return
+        text = ("Последнее сообщение ВК отправлено в настроенную группу Telegram." if success else
+                "Не удалось получить последнее сообщение ВК. Требуется проверка входа и подключения.")
+        try:
+            self.delivery.bot.send_message(reply_chat, text, parse_mode=None)
+        except Exception:
+            pass
 
     def start(self):
         self.thread = threading.Thread(target=self._thread_main, name="vk-relay", daemon=True)
@@ -94,8 +120,10 @@ class VkRelay:
                 with self.store.single_worker():
                     self.delivery.drain()
                     asyncio.run(self._browse())
+                    self.finish_test(False)
                 delay = 5
             except Exception as exc:
+                self.finish_test(False)
                 self.status = "retrying"
                 # Browser/API/DB exceptions may include signed URLs or credentials.
                 LOGGER.error("VK relay interrupted (%s); retrying", type(exc).__name__)
@@ -151,7 +179,7 @@ class VkRelay:
                     if queue.full():
                         self.alert("overflow", "Очередь чтения ВК переполнена. Возможны пропуски; требуется ручная проверка.")
                     else:
-                        queue.put_nowait(messages)
+                        queue.put_nowait((time.monotonic(), messages))
                     seen_response = time.monotonic()
             except (ValueError, UnicodeError, RecursionError):
                 return
@@ -186,15 +214,20 @@ class VkRelay:
                 await page.goto(source_link(self.settings.peer_id), wait_until="domcontentloaded", timeout=60000)
                 started = last_reload = time.monotonic()
                 last_save = 0.0
+                test_started = None
                 while not self.stop.is_set():
                     self.store.ensure_lock()
                     try:
-                        messages = await asyncio.wait_for(queue.get(), timeout=2)
+                        received_at, messages = await asyncio.wait_for(queue.get(), timeout=2)
+                        test_messages = list(messages) if test_started is not None and received_at >= test_started else []
                         # Merge nearby responses before advancing the checkpoint.
                         await asyncio.sleep(0.5)
                         combined = {tuple((m.get("conversation_message_id"), m.get("id"))): m for m in messages}
                         while not queue.empty():
-                            for item in queue.get_nowait():
+                            batch_time, batch = queue.get_nowait()
+                            if test_started is not None and batch_time >= test_started:
+                                test_messages.extend(batch)
+                            for item in batch:
                                 combined[(item.get("conversation_message_id"), item.get("id"))] = item
                         baseline, gap = self.store.observe(list(combined.values()))
                         self.status = "reading"
@@ -202,19 +235,32 @@ class VkRelay:
                             self.delivery.text("Чтение ВК подключено. Уже загруженная история пропущена; пересылаю новые сообщения.")
                         if gap:
                             self.alert("gap", "После перерыва история ВК не перекрывает сохранённую позицию. Возможны пропущенные сообщения; требуется ручная проверка.")
+                        if test_messages:
+                            latest = max(test_messages, key=lambda item: message_number(item)[1])
+                            await asyncio.to_thread(self.delivery.test_message, latest)
+                            self.finish_test(True)
+                            test_started = None
                     except asyncio.TimeoutError:
                         pass
                     # Sending can take time; keep the browser event loop running.
                     await asyncio.to_thread(self.delivery.drain)
                     now = time.monotonic()
                     if seen_response and now - last_save > 60 and now - seen_response < 180:
-                        self.store.save_session(await context.storage_state(indexed_db=True))
+                        self.store.save_session(compact_session(await context.storage_state(indexed_db=True)))
                         self.force_reset = False
                         last_save = now
                     if now - (seen_response or started) > max(180, self.settings.refresh * 2):
                         self.status = "needs_review"
                         self.alert("unreadable", "Не удалось прочитать сообщения ВК: вход истёк, нет доступа или изменился формат страницы. Требуется ручная проверка.")
-                    if now - last_reload >= self.settings.refresh:
+                    if test_started is not None and now - test_started > 60:
+                        self.finish_test(False)
+                        test_started = None
+                    if self.test_event.is_set() and test_started is None:
+                        self.test_event.clear()
+                        test_started = time.monotonic()
+                        await page.reload(wait_until="domcontentloaded", timeout=60000)
+                        last_reload = time.monotonic()
+                    elif now - last_reload >= self.settings.refresh:
                         await page.reload(wait_until="domcontentloaded", timeout=60000)
                         last_reload = time.monotonic()
             finally:
