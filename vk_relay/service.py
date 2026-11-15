@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import unquote_plus, urlsplit
+
+from .delivery import Delivery
+from .messages import extract_messages, parse_payload, request_peer, source_link
+from .store import Store
+
+
+LOGGER = logging.getLogger(__name__)
+WRITE_METHOD = re.compile(r"(?:messages\.(?:send|edit|delete|restore|addChatUser|removeChatUser|createChat)|"
+                          r"wall\.(?:post|edit|delete)|act=(?:a_send|send|a_edit|a_delete))", re.I)
+HISTORY_METHOD = re.compile(r"messages\.(?:getHistory|getByConversationMessageId|getById)(?:\b|\()", re.I)
+
+
+@dataclass(frozen=True)
+class RelaySettings:
+    target_chat: int
+    peer_id: int
+    mention: str
+    database_url: str
+    session_file: str
+    refresh: int = 120
+    max_bytes: int = 45 * 1024 * 1024
+
+    @classmethod
+    def environment(cls, database_url: str):
+        if os.getenv("VK_RELAY_ENABLED", "0").lower() not in {"1", "true", "yes"}:
+            return None
+        target = int(os.getenv("VK_TG_CHAT_ID", "0"))
+        if target >= 0:
+            raise ValueError("VK_TG_CHAT_ID must identify a Telegram group (negative integer)")
+        peer = int(os.getenv("VK_PEER_ID", "2000000012"))
+        if peer <= 2000000000:
+            raise ValueError("VK_PEER_ID must identify the VK group conversation")
+        mention = os.getenv("VK_REVIEW_MENTION", "@thelovelesss")
+        if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", mention):
+            raise ValueError("Invalid VK_REVIEW_MENTION")
+        url = os.getenv("VK_DATABASE_URL", database_url)
+        if url.startswith("postgres://"):
+            url = "postgresql+psycopg://" + url[len("postgres://"):]
+        elif url.startswith("postgresql://"):
+            url = "postgresql+psycopg://" + url[len("postgresql://"):]
+        if os.getenv("RENDER") and url.startswith("sqlite"):
+            raise ValueError("VK relay on Render needs persistent PostgreSQL; SQLite is ephemeral")
+        refresh = int(os.getenv("VK_REFRESH_SECONDS", "120"))
+        if not 30 <= refresh <= 900:
+            raise ValueError("VK_REFRESH_SECONDS must be between 30 and 900")
+        return cls(target, peer, mention, url,
+                   os.getenv("VK_SESSION_FILE", "/etc/secrets/vk_auth.json"), refresh)
+
+
+class VkRelay:
+    def __init__(self, bot, settings: RelaySettings):
+        self.settings = settings
+        self.store = Store(settings.database_url, f"{settings.peer_id}:{settings.target_chat}")
+        self.delivery = Delivery(bot, self.store, settings.target_chat, settings.peer_id,
+                                 settings.mention, settings.max_bytes)
+        self.stop = threading.Event()
+        self.thread = None
+        self.status = "starting"
+        self.alert_times: dict[str, float] = {}
+        self.force_reset = os.getenv("VK_SESSION_RESET", "0") == "1"
+
+    def start(self):
+        self.thread = threading.Thread(target=self._thread_main, name="vk-relay", daemon=True)
+        self.thread.start()
+
+    def shutdown(self):
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=10)
+
+    def alert(self, key: str, text: str):
+        if time.monotonic() - self.alert_times.get(key, -100000) < 3600:
+            return
+        self.delivery.text(f"{self.settings.mention} {text}\n{source_link(self.settings.peer_id)}")
+        self.alert_times[key] = time.monotonic()
+
+    def _thread_main(self):
+        delay = 5
+        while not self.stop.is_set():
+            try:
+                self.store.setup()
+                with self.store.single_worker():
+                    self.delivery.drain()
+                    asyncio.run(self._browse())
+                delay = 5
+            except Exception as exc:
+                self.status = "retrying"
+                # Browser/API/DB exceptions may include signed URLs or credentials.
+                LOGGER.error("VK relay interrupted (%s); retrying", type(exc).__name__)
+                try:
+                    self.alert("interrupted", "Пересылка ВК прервана. Требуется ручная проверка; бот пробует подключиться снова.")
+                except Exception:
+                    pass
+            self.stop.wait(delay)
+            delay = min(delay * 2, 300)
+        self.status = "stopped"
+
+    async def _browse(self):
+        # Imported only when enabled, so normal schedule deployments don't need
+        # Playwright or a browser.
+        from playwright.async_api import async_playwright
+
+        initial = None if self.force_reset else self.store.load_session()
+        if initial is None:
+            try:
+                initial = json.loads(Path(self.settings.session_file).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                self.status = "needs_login"
+                self.alert("login", "Нужна сессия входа ВК. Пересылка ожидает настройки.")
+                self.stop.wait(30)
+                return
+        queue: asyncio.Queue = asyncio.Queue(maxsize=8)
+        tasks: set[asyncio.Task] = set()
+        seen_response = 0.0
+
+        async def capture(response):
+            nonlocal seen_response
+            host = (urlsplit(response.url).hostname or "").lower()
+            if not any(host == domain or host.endswith("." + domain) for domain in ("vk.ru", "vk.com")):
+                return
+            if response.request.resource_type not in {"xhr", "fetch"}:
+                return
+            request_description = unquote_plus(response.url + " " + (response.request.post_data or ""))
+            # Conversation-list previews may be truncated. Only history responses
+            # qualify as full messages; unknown client formats raise a stale alert.
+            if not HISTORY_METHOD.search(request_description):
+                return
+            length = response.headers.get("content-length", "0")
+            if length.isdigit() and int(length) > 8_000_000:
+                return
+            try:
+                body = await response.body()
+                if len(body) > 8_000_000:
+                    return
+                data = parse_payload(body.decode("utf-8"))
+                messages = extract_messages(data, self.settings.peer_id,
+                                            request_peer(response.url, response.request.post_data))
+                if messages:
+                    if queue.full():
+                        self.alert("overflow", "Очередь чтения ВК переполнена. Возможны пропуски; требуется ручная проверка.")
+                    else:
+                        queue.put_nowait(messages)
+                    seen_response = time.monotonic()
+            except (ValueError, UnicodeError, RecursionError):
+                return
+            except Exception:
+                # Aborted responses during reload are normal. Persistent loss of
+                # readable responses is reported by the stale timer below.
+                return
+
+        def on_response(response):
+            task = asyncio.create_task(capture(response))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+        async def guard(route):
+            request = route.request
+            text = unquote_plus(request.url + " " + (request.post_data or ""))
+            if WRITE_METHOD.search(text):
+                await route.abort()
+            elif request.resource_type in {"image", "media", "font"}:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+            context = await browser.new_context(storage_state=initial, service_workers="block",
+                                                locale="ru-RU", viewport={"width": 1000, "height": 750})
+            await context.route("**/*", guard)
+            page = await context.new_page()
+            page.on("response", on_response)
+            try:
+                await page.goto(source_link(self.settings.peer_id), wait_until="domcontentloaded", timeout=60000)
+                started = last_reload = time.monotonic()
+                last_save = 0.0
+                while not self.stop.is_set():
+                    self.store.ensure_lock()
+                    try:
+                        messages = await asyncio.wait_for(queue.get(), timeout=2)
+                        # Merge nearby responses before advancing the checkpoint.
+                        await asyncio.sleep(0.5)
+                        combined = {tuple((m.get("conversation_message_id"), m.get("id"))): m for m in messages}
+                        while not queue.empty():
+                            for item in queue.get_nowait():
+                                combined[(item.get("conversation_message_id"), item.get("id"))] = item
+                        baseline, gap = self.store.observe(list(combined.values()))
+                        self.status = "reading"
+                        if baseline:
+                            self.delivery.text("Чтение ВК подключено. Уже загруженная история пропущена; пересылаю новые сообщения.")
+                        if gap:
+                            self.alert("gap", "После перерыва история ВК не перекрывает сохранённую позицию. Возможны пропущенные сообщения; требуется ручная проверка.")
+                    except asyncio.TimeoutError:
+                        pass
+                    # Sending can take time; keep the browser event loop running.
+                    await asyncio.to_thread(self.delivery.drain)
+                    now = time.monotonic()
+                    if seen_response and now - last_save > 60 and now - seen_response < 180:
+                        self.store.save_session(await context.storage_state(indexed_db=True))
+                        self.force_reset = False
+                        last_save = now
+                    if now - (seen_response or started) > max(180, self.settings.refresh * 2):
+                        self.status = "needs_review"
+                        self.alert("unreadable", "Не удалось прочитать сообщения ВК: вход истёк, нет доступа или изменился формат страницы. Требуется ручная проверка.")
+                    if now - last_reload >= self.settings.refresh:
+                        await page.reload(wait_until="domcontentloaded", timeout=60000)
+                        last_reload = time.monotonic()
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await browser.close()
