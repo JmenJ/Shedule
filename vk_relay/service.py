@@ -181,6 +181,9 @@ class VkRelay:
                 data = parse_payload(body.decode("utf-8"))
                 messages = extract_messages(data, self.settings.peer_id,
                                             request_peer(response.url, response.request.post_data))
+                if not seen_response:
+                    LOGGER.info("VK history response: HTTP %s, parsed messages=%s",
+                                response.status, len(messages))
                 if messages:
                     if queue.full():
                         self.alert("overflow", "Очередь чтения ВК переполнена. Возможны пропуски; требуется ручная проверка.")
@@ -210,14 +213,18 @@ class VkRelay:
                 await route.continue_()
 
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+            browser = await playwright.chromium.launch(headless=True, args=[
+                "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer",
+                "--renderer-process-limit=1", "--no-zygote", "--js-flags=--max-old-space-size=128",
+            ])
             context = await browser.new_context(storage_state=initial, service_workers="block",
                                                 locale="ru-RU", viewport={"width": 1000, "height": 750})
             await context.route("**/*", guard)
             page = await context.new_page()
             page.on("response", on_response)
             try:
-                await page.goto(source_link(self.settings.peer_id), wait_until="domcontentloaded", timeout=60000)
+                await page.goto(source_link(self.settings.peer_id), wait_until="commit", timeout=60000)
+                LOGGER.info("VK page opened on host=%s", urlsplit(page.url).hostname)
                 started = last_reload = time.monotonic()
                 last_save = 0.0
                 test_started = None
