@@ -79,6 +79,7 @@ class VkRelay:
         self.force_reset = os.getenv("VK_SESSION_RESET", "0") == "1"
         self.test_lock = threading.Lock()
         self.test_reply_chat = None
+        self.test_requested_at = None
         self.test_event = threading.Event()
 
     def request_test(self, reply_chat: int) -> bool:
@@ -86,6 +87,7 @@ class VkRelay:
             if self.test_reply_chat is not None:
                 return False
             self.test_reply_chat = reply_chat
+            self.test_requested_at = time.monotonic()
             self.test_event.set()
             return True
 
@@ -93,6 +95,7 @@ class VkRelay:
         with self.test_lock:
             reply_chat = self.test_reply_chat
             self.test_reply_chat = None
+            self.test_requested_at = None
             self.test_event.clear()
         if reply_chat is None or (success and reply_chat == self.settings.target_chat):
             return
@@ -121,13 +124,15 @@ class VkRelay:
     def _thread_main(self):
         delay = 5
         while not self.stop.is_set():
+            cycle_started = time.monotonic()
             try:
                 self.store.setup()
                 with self.store.single_worker():
                     self.delivery.drain()
-                    asyncio.run(self._browse())
-                    self.finish_test(False)
-                delay = 5
+                    got_batch = asyncio.run(self._browse())
+                    if not got_batch:
+                        self.finish_test(False)
+                delay = max(5, self.settings.refresh - (time.monotonic() - cycle_started))
             except Exception as exc:
                 self.finish_test(False)
                 self.status = "retrying"
@@ -137,7 +142,11 @@ class VkRelay:
                     self.alert("interrupted", "Пересылка ВК прервана. Требуется ручная проверка; бот пробует подключиться снова.")
                 except Exception:
                     pass
-            self.stop.wait(delay)
+            deadline = time.monotonic() + delay
+            while not self.stop.is_set() and time.monotonic() < deadline:
+                if self.test_reply_chat is not None:
+                    break
+                self.stop.wait(min(1, max(0, deadline - time.monotonic())))
             delay = min(delay * 2, 300)
         self.status = "stopped"
 
@@ -221,6 +230,7 @@ class VkRelay:
                                                 locale="ru-RU", viewport={"width": 1000, "height": 750})
             await context.route("**/*", guard)
             page = await context.new_page()
+            browser_closed = False
             page.on("response", on_response)
             page.on("crash", lambda _: LOGGER.warning("VK browser page crashed"))
             try:
@@ -228,12 +238,17 @@ class VkRelay:
                 LOGGER.info("VK page opened on host=%s", urlsplit(page.url).hostname)
                 started = last_reload = time.monotonic()
                 last_save = 0.0
-                test_started = None
+                test_started = self.test_requested_at
+                if test_started is not None:
+                    self.test_event.clear()
                 page_checked = False
                 while not self.stop.is_set():
                     self.store.ensure_lock()
                     try:
                         received_at, messages = await asyncio.wait_for(queue.get(), timeout=2)
+                        if test_started is None and self.test_reply_chat is not None:
+                            test_started = self.test_requested_at
+                            self.test_event.clear()
                         test_messages = list(messages) if test_started is not None and received_at >= test_started else []
                         # Merge nearby responses before advancing the checkpoint.
                         await asyncio.sleep(0.5)
@@ -245,6 +260,15 @@ class VkRelay:
                             for item in batch:
                                 combined[(item.get("conversation_message_id"), item.get("id"))] = item
                         baseline, gap = self.store.observe(list(combined.values()))
+                        if self.settings.storage == "memory":
+                            # History is available before VK finishes rendering.
+                            # Release Chromium before sending attachments so the
+                            # remaining UI cannot exhaust a free host's memory.
+                            refreshed_session = dict(initial)
+                            refreshed_session["cookies"] = await context.cookies()
+                            self.store.save_session(refreshed_session)
+                            await browser.close()
+                            browser_closed = True
                         self.status = "reading"
                         if baseline:
                             self.delivery.text("Чтение ВК подключено. Уже загруженная история пропущена; пересылаю новые сообщения.")
@@ -253,8 +277,13 @@ class VkRelay:
                         if test_messages:
                             latest = max(test_messages, key=lambda item: message_number(item)[1])
                             await asyncio.to_thread(self.delivery.test_message, latest)
+                            LOGGER.info("VK last-message test delivered")
                             self.finish_test(True)
                             test_started = None
+                        if self.settings.storage == "memory":
+                            await asyncio.to_thread(self.delivery.drain)
+                            LOGGER.info("VK polling batch processed: messages=%s, baseline=%s", len(combined), baseline)
+                            return True
                     except asyncio.TimeoutError:
                         pass
                     # Sending can take time; keep the browser event loop running.
@@ -279,14 +308,15 @@ class VkRelay:
                     if now - (seen_response or started) > max(180, self.settings.refresh * 2):
                         self.status = "needs_review"
                         self.alert("unreadable", "Не удалось прочитать сообщения ВК: вход истёк, нет доступа или изменился формат страницы. Требуется ручная проверка.")
-                    if test_started is not None and now - test_started > 60:
+                    if test_started is not None and now - test_started > 180:
                         self.finish_test(False)
                         test_started = None
                     if self.test_event.is_set() and test_started is None:
                         self.test_event.clear()
-                        test_started = time.monotonic()
-                        await page.reload(wait_until="domcontentloaded", timeout=60000)
-                        last_reload = time.monotonic()
+                        test_started = self.test_requested_at
+                        if seen_response:
+                            await page.reload(wait_until="domcontentloaded", timeout=60000)
+                            last_reload = time.monotonic()
                     elif now - last_reload >= self.settings.refresh and (seen_response or now - started >= 600):
                         await page.reload(wait_until="domcontentloaded", timeout=60000)
                         last_reload = time.monotonic()
@@ -294,4 +324,5 @@ class VkRelay:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-                await browser.close()
+                if not browser_closed:
+                    await browser.close()
