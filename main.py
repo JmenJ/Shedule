@@ -12,6 +12,7 @@ from config import Settings
 from database import Repository
 from handlers import BotHandlers
 from notifications import NotificationDispatcher
+from vk_relay.service import RelaySettings, VkRelay
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -27,13 +28,21 @@ bot = telebot.TeleBot(settings.bot_token, threaded=True)
 handlers = BotHandlers(bot, repository, settings)
 handlers.register()
 notification_dispatcher = NotificationDispatcher(bot, repository)
+vk_relay = None
+try:
+    vk_settings = RelaySettings.environment(settings.database_url)
+    if vk_settings is not None:
+        vk_relay = VkRelay(bot, vk_settings)
+except Exception:
+    LOGGER.error("VK relay configuration is invalid; schedule bot remains available")
 
 app = Flask(__name__)
 
 
 @app.get("/")
 def healthcheck():
-    return jsonify(status="ok", service="schedule-bot")
+    return jsonify(status="ok", service="schedule-bot",
+                   vk_relay=vk_relay.status if vk_relay else "disabled")
 
 
 @app.post("/webhook")
@@ -80,6 +89,8 @@ def configure_telegram() -> None:
 if __name__ == "__main__":
     configure_telegram()
     notification_dispatcher.start()
+    if vk_relay:
+        vk_relay.start()
     try:
         if settings.webhook_url:
             port = int(os.environ.get("PORT", "10000"))
@@ -87,4 +98,6 @@ if __name__ == "__main__":
         else:
             bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
     finally:
+        if vk_relay:
+            vk_relay.shutdown()
         notification_dispatcher.shutdown()

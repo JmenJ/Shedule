@@ -1,0 +1,29 @@
+# Reference for a NEW combined service. Do not create a second always-on Free
+# service in the same workspace: both share the 750-hour monthly allowance.
+services:
+  - type: web
+    name: schedule-with-vk
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_OWNER_IDS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: VK_RELAY_ENABLED
+        value: "1"
+      - key: VK_TG_CHAT_ID
+        sync: false
+      - key: VK_PEER_ID
+        value: "2000000012"
+      - key: VK_REVIEW_MENTION
+        value: "@thelovelesss"
+      - key: VK_SESSION_FILE
+        value: /etc/secrets/vk_auth.json
