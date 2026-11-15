@@ -11,14 +11,16 @@ services:
         sync: false
       - key: BOT_OWNER_IDS
         sync: false
-      - key: DATABASE_URL
-        sync: false
       - key: WEBHOOK_URL
         sync: false
       - key: WEBHOOK_SECRET
         sync: false
       - key: VK_RELAY_ENABLED
         value: "1"
+      - key: VK_RELAY_ONLY
+        value: "1"
+      - key: VK_RELAY_STORAGE
+        value: memory
       - key: VK_TG_CHAT_ID
         sync: false
       - key: VK_PEER_ID

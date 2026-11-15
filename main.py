@@ -4,6 +4,11 @@ import hmac
 import logging
 import os
 
+if __name__ == "__main__" and os.getenv("VK_RELAY_ONLY", "0") == "1":
+    from vk_relay.web import run_standalone
+    run_standalone()
+    raise SystemExit(0)
+
 import telebot
 from flask import Flask, abort, jsonify, request
 from telebot import types
