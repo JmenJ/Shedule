@@ -270,7 +270,9 @@ class VkRelay:
                                         any(word in visible for word in ("captcha", "капч", "я не робот")))
                         except Exception as exc:
                             LOGGER.warning("VK page diagnostic unavailable (%s)", type(exc).__name__)
-                    if seen_response and now - last_save > 60 and now - seen_response < 180:
+                    # Memory mode keeps the live browser session until restart.
+                    # Avoid exporting VK's large IndexedDB caches on 512 MB hosts.
+                    if self.settings.storage != "memory" and seen_response and now - last_save > 60 and now - seen_response < 180:
                         self.store.save_session(compact_session(await context.storage_state(indexed_db=True)))
                         self.force_reset = False
                         last_save = now
@@ -285,7 +287,7 @@ class VkRelay:
                         test_started = time.monotonic()
                         await page.reload(wait_until="domcontentloaded", timeout=60000)
                         last_reload = time.monotonic()
-                    elif now - last_reload >= self.settings.refresh:
+                    elif now - last_reload >= self.settings.refresh and (seen_response or now - started >= 600):
                         await page.reload(wait_until="domcontentloaded", timeout=60000)
                         last_reload = time.monotonic()
             finally:
