@@ -285,7 +285,8 @@ class BrowserLoopTests(TestCase):
 
         class Page:
             url = "https://vk.ru/im/convo/2000000012"
-            def on(self, event, handler): self.handler = handler
+            def on(self, event, handler):
+                if event == "response": self.handler = handler
             async def goto(self, *args, **kwargs): self.handler(Response([message(1)]))
             async def reload(self, **kwargs): self.handler(Response([message(1), message(2)]))
 
