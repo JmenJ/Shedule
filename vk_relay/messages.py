@@ -169,14 +169,13 @@ def plan_message(message: dict, peer_id: int, mention: str) -> list[Part]:
                 unsupported.add(str(kind))
         reply = item.get("reply_message")
         if isinstance(reply, dict):
-            text(f"Ответ на сообщение от VK ID {reply.get('from_id', '?')}:")
+            text("Ответ:")
             visit(reply, depth + 1)
         for forwarded in (item.get("fwd_messages") or []):
             if isinstance(forwarded, dict):
-                text(f"Переслано от VK ID {forwarded.get('from_id', '?')}:")
+                text("Пересланное сообщение:")
                 visit(forwarded, depth + 1)
 
-    text(f"ВК · отправитель {message.get('from_id', '?')} · сообщение №{number}\n{source_link(peer_id)}")
     visit(message)
     if not message.get("text") and not message.get("attachments") and not message.get("action") and not message.get("fwd_messages"):
         unsupported.add("пустое или неизвестное содержимое")

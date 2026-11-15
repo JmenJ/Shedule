@@ -16,8 +16,10 @@ def register_commands(bot, relay_getter, owner_ids):
             bot.reply_to(message, "Отправь /vk_test в целевой группе Telegram или в личном чате с ботом.")
             return
         if relay.request_test(message.chat.id):
-            bot.reply_to(message, "Проверяю последнее сообщение ВК. Результат придёт в настроенную группу Telegram.")
+            if message.chat.type == "private":
+                bot.reply_to(message, "Проверяю последнее сообщение ВК. Результат придёт в настроенную группу Telegram.")
         else:
-            bot.reply_to(message, "Проверка уже запрошена. Дождись результата.")
+            if message.chat.type == "private":
+                bot.reply_to(message, "Проверка уже запрошена. Дождись результата.")
 
     bot.register_message_handler(test_latest, commands=["vk_test"])

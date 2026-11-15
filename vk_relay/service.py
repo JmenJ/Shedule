@@ -270,8 +270,6 @@ class VkRelay:
                             await browser.close()
                             browser_closed = True
                         self.status = "reading"
-                        if baseline:
-                            self.delivery.text("Чтение ВК подключено. Уже загруженная история пропущена; пересылаю новые сообщения.")
                         if gap:
                             self.alert("gap", "После перерыва история ВК не перекрывает сохранённую позицию. Возможны пропущенные сообщения; требуется ручная проверка.")
                         if test_messages:

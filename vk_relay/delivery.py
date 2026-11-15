@@ -107,7 +107,6 @@ class Delivery:
 
     def test_message(self, message: dict) -> None:
         """An intentional test copy never updates the normal outbox/cursor."""
-        self.text("🧪 Тест: последнее доступное сообщение из беседы ВК.")
         number = message.get("conversation_message_id") or message["id"]
         for part in plan_message(message, self.peer_id, self.mention):
             self.store.ensure_lock()
