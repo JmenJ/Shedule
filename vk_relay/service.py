@@ -215,7 +215,7 @@ class VkRelay:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True, args=[
                 "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer",
-                "--renderer-process-limit=1", "--no-zygote", "--js-flags=--max-old-space-size=128",
+                "--single-process", "--no-zygote", "--js-flags=--max-old-space-size=128",
             ])
             context = await browser.new_context(storage_state=initial, service_workers="block",
                                                 locale="ru-RU", viewport={"width": 1000, "height": 750})
