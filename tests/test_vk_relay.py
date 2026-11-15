@@ -266,13 +266,22 @@ class BrowserLoopTests(TestCase):
     setUp = StoreTests.setUp
     tearDown = StoreTests.tearDown
     def test_browser_responses_drive_delivery_and_save_session(self):
+        self._browser_cycle("postgres")
+
+    def test_memory_polling_closes_browser_before_delivery_and_keeps_position(self):
+        self._browser_cycle("memory")
+
+    def _browser_cycle(self, storage):
         auth = Path(self.temp.name) / "auth.json"
         auth.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
-        settings = RelaySettings(-100, PEER, "@thelovelesss", self.url, str(auth), refresh=0)
+        settings = RelaySettings(-100, PEER, "@thelovelesss", self.url, str(auth), refresh=0, storage=storage)
         bot = FakeBot()
         relay = VkRelay(bot, settings)
-        relay.store = self.store
-        relay.delivery.store = self.store
+        if storage == "postgres":
+            relay.store = self.store
+            relay.delivery.store = self.store
+        closed = []
+        cycles = []
 
         class Response:
             url = "https://api.vk.ru/method/messages.getHistory"
@@ -287,20 +296,25 @@ class BrowserLoopTests(TestCase):
             url = "https://vk.ru/im/convo/2000000012"
             def on(self, event, handler):
                 if event == "response": self.handler = handler
-            async def goto(self, *args, **kwargs): self.handler(Response([message(1)]))
+            async def goto(self, *args, **kwargs):
+                self.handler(Response([message(1)] if len(cycles) == 1 else [message(1), message(2)]))
             async def reload(self, **kwargs): self.handler(Response([message(1), message(2)]))
 
         class Context:
             async def route(self, *args): pass
             async def new_page(self): return Page()
-            async def storage_state(self, **kwargs): return {"cookies": [], "origins": []}
+            async def storage_state(self, **kwargs):
+                if storage == "memory": raise AssertionError("Memory mode must not export caches")
+                return {"cookies": [], "origins": []}
 
         class Browser:
             async def new_context(self, **kwargs): return Context()
-            async def close(self): pass
+            async def close(self): closed.append(len(cycles))
 
         class Chromium:
-            async def launch(self, **kwargs): return Browser()
+            async def launch(self, **kwargs):
+                cycles.append(True)
+                return Browser()
 
         class Playwright:
             chromium = Chromium()
@@ -309,19 +323,24 @@ class BrowserLoopTests(TestCase):
 
         original = bot.send_message
         def send(chat, text, **kwargs):
+            if storage == "memory": self.assertIn(len(cycles), closed)
             original(chat, text, **kwargs)
             if text == "Message 2":
                 relay.stop.set()
         bot.send_message = send
         relay.request_test(-100)
-        with self.store.single_worker(), patch("playwright.async_api.async_playwright", return_value=Playwright()):
+        with relay.store.single_worker(), patch("playwright.async_api.async_playwright", return_value=Playwright()):
             asyncio.run(asyncio.wait_for(relay._browse(), timeout=10))
+            if storage == "memory":
+                self.assertEqual(relay.store.state()[1], 1)
+                asyncio.run(asyncio.wait_for(relay._browse(), timeout=10))
         self.assertIn("Message 2", bot.sent)
-        self.assertNotIn("Message 1", bot.sent)
-        self.assertEqual(bot.sent.count("Message 2"), 2)
+        self.assertEqual(bot.sent.count("Message 1"), 1)
+        self.assertEqual(bot.sent.count("Message 2"), 1)
         self.assertTrue(any("Тест:" in text for text in bot.sent))
-        self.assertEqual(self.store.state()[1], 2)
-        self.assertIsNotNone(self.store.load_session())
+        self.assertEqual(relay.store.state()[1], 2)
+        if storage == "postgres": self.assertIsNotNone(self.store.load_session())
+        else: self.assertEqual(len(closed), 2)
 
     def test_test_request_is_coalesced_and_failure_releases_it(self):
         relay = VkRelay(FakeBot(), RelaySettings(-100, PEER, "@thelovelesss", self.url, "unused"))
