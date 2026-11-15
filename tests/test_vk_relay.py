@@ -273,7 +273,7 @@ class BrowserLoopTests(TestCase):
     def _browser_cycle(self, storage):
         auth = Path(self.temp.name) / "auth.json"
         auth.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
-        settings = RelaySettings(-100, PEER, "@thelovelesss", self.url, str(auth), refresh=0, storage=storage)
+        settings = RelaySettings(-100, PEER, "@thelovelesss", self.url, str(auth), refresh=0, storage=storage, transport="browser")
         bot = FakeBot()
         relay = VkRelay(bot, settings)
         if storage == "postgres":
