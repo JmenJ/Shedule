@@ -222,12 +222,14 @@ class VkRelay:
             await context.route("**/*", guard)
             page = await context.new_page()
             page.on("response", on_response)
+            page.on("crash", lambda _: LOGGER.warning("VK browser page crashed"))
             try:
                 await page.goto(source_link(self.settings.peer_id), wait_until="commit", timeout=60000)
                 LOGGER.info("VK page opened on host=%s", urlsplit(page.url).hostname)
                 started = last_reload = time.monotonic()
                 last_save = 0.0
                 test_started = None
+                page_checked = False
                 while not self.stop.is_set():
                     self.store.ensure_lock()
                     try:
@@ -258,6 +260,16 @@ class VkRelay:
                     # Sending can take time; keep the browser event loop running.
                     await asyncio.to_thread(self.delivery.drain)
                     now = time.monotonic()
+                    if not page_checked and now - started > 30 and not seen_response:
+                        page_checked = True
+                        try:
+                            visible = (await page.locator("body").inner_text(timeout=3000)).lower()
+                            LOGGER.info("VK page diagnostic: host=%s, text_length=%s, login=%s, captcha=%s",
+                                        urlsplit(page.url).hostname, len(visible),
+                                        any(word in visible for word in ("войти в вк", "телефон или почта", "войти или зарегистрироваться")),
+                                        any(word in visible for word in ("captcha", "капч", "я не робот")))
+                        except Exception as exc:
+                            LOGGER.warning("VK page diagnostic unavailable (%s)", type(exc).__name__)
                     if seen_response and now - last_save > 60 and now - seen_response < 180:
                         self.store.save_session(compact_session(await context.storage_state(indexed_db=True)))
                         self.force_reset = False
