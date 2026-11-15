@@ -334,7 +334,7 @@ class BotHandlers:
         )
 
     def my_id(self, message: types.Message) -> None:
-        self.bot.reply_to(message, f"Ваш Telegram ID: {message.from_user.id}")
+        self.bot.reply_to(message, f"Ваш Telegram ID: {message.from_user.id}\nID этого чата: {message.chat.id}")
 
     def admin(self, message: types.Message) -> None:
         if message.chat.type != "private" or not self.is_global_owner(
