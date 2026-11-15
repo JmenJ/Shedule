@@ -14,6 +14,7 @@ from urllib.parse import unquote_plus, urlsplit
 from .delivery import Delivery
 from .messages import extract_messages, message_number, parse_payload, request_peer, source_link
 from .session import compact_session
+from .memory import MemoryStore
 from .store import Store
 
 
@@ -32,6 +33,7 @@ class RelaySettings:
     session_file: str
     refresh: int = 120
     max_bytes: int = 45 * 1024 * 1024
+    storage: str = "postgres"
 
     @classmethod
     def environment(cls, database_url: str):
@@ -51,19 +53,23 @@ class RelaySettings:
             url = "postgresql+psycopg://" + url[len("postgres://"):]
         elif url.startswith("postgresql://"):
             url = "postgresql+psycopg://" + url[len("postgresql://"):]
-        if os.getenv("RENDER") and url.startswith("sqlite"):
+        storage = os.getenv("VK_RELAY_STORAGE", "memory")
+        if storage not in {"memory", "postgres"}:
+            raise ValueError("VK_RELAY_STORAGE must be memory or postgres")
+        if storage == "postgres" and os.getenv("RENDER") and url.startswith("sqlite"):
             raise ValueError("VK relay on Render needs persistent PostgreSQL; SQLite is ephemeral")
         refresh = int(os.getenv("VK_REFRESH_SECONDS", "120"))
         if not 30 <= refresh <= 900:
             raise ValueError("VK_REFRESH_SECONDS must be between 30 and 900")
         return cls(target, peer, mention, url,
-                   os.getenv("VK_SESSION_FILE", "/etc/secrets/vk_auth.json"), refresh)
+                   os.getenv("VK_SESSION_FILE", "/etc/secrets/vk_auth.json"), refresh, storage=storage)
 
 
 class VkRelay:
     def __init__(self, bot, settings: RelaySettings):
         self.settings = settings
-        self.store = Store(settings.database_url, f"{settings.peer_id}:{settings.target_chat}")
+        self.store = (MemoryStore() if settings.storage == "memory" else
+                      Store(settings.database_url, f"{settings.peer_id}:{settings.target_chat}"))
         self.delivery = Delivery(bot, self.store, settings.target_chat, settings.peer_id,
                                  settings.mention, settings.max_bytes)
         self.stop = threading.Event()
