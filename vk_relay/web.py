@@ -19,7 +19,9 @@ def create_web_app(bot, settings, relay):
     @app.get("/")
     def health():
         return jsonify(status="ok", service="vk-relay",
-                       vk_relay=relay.status if relay else "disabled")
+                       vk_relay=relay.status if relay else "disabled",
+                       vk_transport=getattr(getattr(relay, "settings", None), "transport", None),
+                       vk_last_read_seconds_ago=getattr(relay, "last_read_age", None))
 
     @app.post("/webhook")
     def webhook():

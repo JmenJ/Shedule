@@ -34,6 +34,8 @@ class RelaySettings:
     refresh: int = 120
     max_bytes: int = 45 * 1024 * 1024
     storage: str = "postgres"
+    transport: str = "http"
+    poll_seconds: int = 5
 
     @classmethod
     def environment(cls, database_url: str):
@@ -61,8 +63,15 @@ class RelaySettings:
         refresh = int(os.getenv("VK_REFRESH_SECONDS", "120"))
         if not 30 <= refresh <= 900:
             raise ValueError("VK_REFRESH_SECONDS must be between 30 and 900")
+        transport = os.getenv("VK_RELAY_TRANSPORT", "http")
+        if transport not in {"http", "browser"}:
+            raise ValueError("VK_RELAY_TRANSPORT must be http or browser")
+        poll_seconds = int(os.getenv("VK_HTTP_POLL_SECONDS", "5"))
+        if not 3 <= poll_seconds <= 60:
+            raise ValueError("VK_HTTP_POLL_SECONDS must be between 3 and 60")
         return cls(target, peer, mention, url,
-                   os.getenv("VK_SESSION_FILE", "/etc/secrets/vk_auth.json"), refresh, storage=storage)
+                   os.getenv("VK_SESSION_FILE", "/etc/secrets/vk_auth.json"), refresh, storage=storage,
+                   transport=transport, poll_seconds=poll_seconds)
 
 
 class VkRelay:
@@ -81,6 +90,12 @@ class VkRelay:
         self.test_reply_chat = None
         self.test_requested_at = None
         self.test_event = threading.Event()
+        self.http_client = None
+        self.last_read_at = None
+
+    @property
+    def last_read_age(self):
+        return round(time.monotonic() - self.last_read_at, 1) if self.last_read_at is not None else None
 
     def request_test(self, reply_chat: int) -> bool:
         with self.test_lock:
@@ -129,13 +144,21 @@ class VkRelay:
                 self.store.setup()
                 with self.store.single_worker():
                     self.delivery.drain()
-                    got_batch = asyncio.run(self._browse())
+                    got_batch = (self._http_cycle() if self.settings.transport == "http" else
+                                 asyncio.run(self._browse()))
                     if not got_batch:
                         self.finish_test(False)
-                delay = max(5, self.settings.refresh - (time.monotonic() - cycle_started))
+                interval = (self.settings.poll_seconds if self.settings.transport == "http" else
+                            self.settings.refresh)
+                delay = max(0.1, interval - (time.monotonic() - cycle_started))
             except Exception as exc:
                 self.finish_test(False)
-                self.status = "retrying"
+                self.status = ("needs_login" if getattr(exc, "auth", False) else
+                               "needs_review" if getattr(exc, "review", False) else "retrying")
+                if self.status in {"needs_login", "needs_review"}:
+                    delay = max(delay, 60)
+                else:
+                    delay = max(delay, 5)
                 # Browser/API/DB exceptions may include signed URLs or credentials.
                 LOGGER.error("VK relay interrupted (%s); retrying", type(exc).__name__)
                 try:
@@ -149,6 +172,43 @@ class VkRelay:
                 self.stop.wait(min(1, max(0, deadline - time.monotonic())))
             delay = min(delay * 2, 300)
         self.status = "stopped"
+        if self.http_client:
+            self.http_client.close()
+
+    def _http_cycle(self):
+        from .http_client import VkHttpClient, VkSessionExpired
+
+        if self.http_client is None:
+            initial = None if self.force_reset else self.store.load_session()
+            if initial is None:
+                try:
+                    initial = json.loads(Path(self.settings.session_file).read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    raise VkSessionExpired("Saved VK session is unavailable") from None
+            self.http_client = VkHttpClient(initial, self.settings.peer_id)
+        # Only a request that predates this HTTP read qualifies for /vk_test.
+        test_requested = self.test_requested_at
+        kind, cursor = self.store.state()
+        messages = self.http_client.history_since(kind, cursor)
+        self.last_read_at = time.monotonic()
+        self.store.save_session(self.http_client.storage_state())
+        self.force_reset = False
+        baseline, gap = self.store.observe(messages)
+        self.status = "reading"
+        if gap:
+            self.alert("gap", "После перерыва история ВК не перекрывает сохранённую позицию. Возможны пропущенные сообщения; требуется ручная проверка.")
+        self.delivery.drain()
+        if test_requested is not None and messages:
+            latest = max(messages, key=lambda item: message_number(item)[1])
+            self.delivery.test_message(latest)
+            self.finish_test(True)
+            LOGGER.info("VK HTTP last-message test delivered")
+        elif test_requested is not None:
+            self.finish_test(False)
+        # One safe startup/catch-up log; unchanged history is silent.
+        if baseline or any(message_number(m)[1] > cursor for m in messages):
+            LOGGER.info("VK HTTP batch processed: messages=%s, baseline=%s", len(messages), baseline)
+        return True
 
     async def _browse(self):
         # Imported only when enabled, so normal schedule deployments don't need
@@ -270,6 +330,7 @@ class VkRelay:
                             await browser.close()
                             browser_closed = True
                         self.status = "reading"
+                        self.last_read_at = time.monotonic()
                         if gap:
                             self.alert("gap", "После перерыва история ВК не перекрывает сохранённую позицию. Возможны пропущенные сообщения; требуется ручная проверка.")
                         if test_messages:
