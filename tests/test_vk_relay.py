@@ -12,6 +12,10 @@ from vk_relay.delivery import Delivery, allowed_media_url, download
 from vk_relay.messages import chunks, extract_messages, parse_payload, plan_message, request_peer
 from vk_relay.service import RelaySettings, VkRelay, WRITE_METHOD, HISTORY_METHOD
 from vk_relay.store import Store
+from vk_relay.commands import register_commands
+from vk_relay.session import compact_session
+from vk_relay.memory import MemoryStore
+from vk_relay.web import create_web_app
 
 
 PEER = 2000000012
@@ -141,6 +145,16 @@ class FakeBot:
 class DeliveryTests(TestCase):
     setUp = StoreTests.setUp
     tearDown = StoreTests.tearDown
+    def test_manual_copy_does_not_advance_regular_checkpoint(self):
+        self.store.observe([message(1)])
+        bot = FakeBot()
+        delivery = Delivery(bot, self.store, -100, PEER, "@thelovelesss", 1024)
+        with self.store.single_worker():
+            delivery.test_message(message(99))
+        self.assertEqual(self.store.state()[1], 1)
+        self.assertEqual(self.store.pending(), [])
+        self.assertIn("Тест", bot.sent[0])
+        self.assertIn("Message 99", bot.sent)
     def test_resume_does_not_repeat_completed_parts(self):
         self.store.observe([message(1)])
         self.store.observe([message(2, text="body")])
@@ -197,7 +211,7 @@ class ConfigurationTests(TestCase):
     def test_disabled_by_default_and_render_rejects_ephemeral_state(self):
         with patch.dict("os.environ", {}, clear=True):
             self.assertIsNone(RelaySettings.environment("sqlite:///test.db"))
-        with patch.dict("os.environ", {"VK_RELAY_ENABLED": "1", "VK_TG_CHAT_ID": "-100", "RENDER": "true"}, clear=True):
+        with patch.dict("os.environ", {"VK_RELAY_ENABLED": "1", "VK_TG_CHAT_ID": "-100", "RENDER": "true", "VK_RELAY_STORAGE": "postgres"}, clear=True):
             with self.assertRaisesRegex(ValueError, "persistent"):
                 RelaySettings.environment("sqlite:///test.db")
 
@@ -206,6 +220,46 @@ class ConfigurationTests(TestCase):
             result = RelaySettings.environment("sqlite:///test.db")
         self.assertEqual(result.peer_id, PEER)
         self.assertEqual(result.mention, "@thelovelesss")
+        self.assertEqual(result.storage, "memory")
+
+    def test_memory_mode_on_render_never_opens_a_database(self):
+        with patch.dict("os.environ", {"VK_RELAY_ENABLED": "1", "VK_TG_CHAT_ID": "-100", "RENDER": "true"}, clear=True):
+            result = RelaySettings.environment("postgresql+psycopg://unavailable")
+            with patch("vk_relay.service.Store", side_effect=AssertionError("DB must not be opened")):
+                relay = VkRelay(FakeBot(), result)
+        self.assertIsInstance(relay.store, MemoryStore)
+
+
+class MemoryModeTests(TestCase):
+    def test_realtime_delivery_deduplicates_until_restart(self):
+        store = MemoryStore()
+        store.setup()
+        self.assertEqual(store.observe([message(1)]), (True, False))
+        store.observe([message(1), message(2)])
+        store.observe([message(2)])
+        bot = FakeBot()
+        delivery = Delivery(bot, store, -100, PEER, "@thelovelesss", 1024)
+        with store.single_worker():
+            delivery.drain()
+            delivery.drain()
+        self.assertEqual(bot.sent.count("Message 2"), 1)
+        self.assertEqual(store.state()[1], 2)
+        restarted = MemoryStore()
+        self.assertEqual(restarted.observe([message(2), message(3)]), (True, False))
+        self.assertEqual(restarted.pending(), [])
+
+    def test_standalone_http_health_and_webhook_authentication(self):
+        updates = []
+        bot = SimpleNamespace(process_new_updates=lambda values: updates.extend(values))
+        settings = SimpleNamespace(webhook_secret="test-secret-123456")
+        app = create_web_app(bot, settings, SimpleNamespace(status="reading"))
+        client = app.test_client()
+        self.assertEqual(client.get("/").json["service"], "vk-relay")
+        self.assertEqual(client.post("/webhook", json={"update_id": 1}).status_code, 403)
+        response = client.post("/webhook", json={"update_id": 1},
+                               headers={"X-Telegram-Bot-Api-Secret-Token": settings.webhook_secret})
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(updates[0].update_id, 1)
 
 
 class BrowserLoopTests(TestCase):
@@ -256,9 +310,68 @@ class BrowserLoopTests(TestCase):
             if text == "Message 2":
                 relay.stop.set()
         bot.send_message = send
+        relay.request_test(-100)
         with self.store.single_worker(), patch("playwright.async_api.async_playwright", return_value=Playwright()):
             asyncio.run(asyncio.wait_for(relay._browse(), timeout=10))
         self.assertIn("Message 2", bot.sent)
         self.assertNotIn("Message 1", bot.sent)
+        self.assertEqual(bot.sent.count("Message 2"), 2)
+        self.assertTrue(any("Тест:" in text for text in bot.sent))
         self.assertEqual(self.store.state()[1], 2)
         self.assertIsNotNone(self.store.load_session())
+
+    def test_test_request_is_coalesced_and_failure_releases_it(self):
+        relay = VkRelay(FakeBot(), RelaySettings(-100, PEER, "@thelovelesss", self.url, "unused"))
+        self.assertTrue(relay.request_test(-100))
+        self.assertFalse(relay.request_test(-100))
+        relay.finish_test(False)
+        self.assertTrue(relay.request_test(-100))
+        self.assertIn("Не удалось", relay.delivery.bot.sent[-1])
+
+
+class CommandTests(TestCase):
+    def setUp(self):
+        self.replies = []
+        self.requests = []
+        self.relay = SimpleNamespace(settings=SimpleNamespace(target_chat=-100),
+                                     request_test=lambda chat: self.requests.append(chat) or True)
+        def register(callback, **kwargs):
+            self.callback = callback
+            self.assertEqual(kwargs["commands"], ["vk_test"])
+        self.bot = SimpleNamespace(register_message_handler=register,
+                                   reply_to=lambda msg, text: self.replies.append(text))
+        register_commands(self.bot, lambda: self.relay, {1})
+
+    def test_only_owner_can_request_a_copy(self):
+        self.callback(SimpleNamespace(from_user=SimpleNamespace(id=2), chat=SimpleNamespace(id=-100, type="supergroup")))
+        self.assertEqual(self.requests, [])
+        self.assertIn("только владельцу", self.replies[-1])
+
+    def test_owner_can_test_from_target_or_private_but_not_another_group(self):
+        for chat, kind in ((-200, "supergroup"), (-100, "supergroup"), (1, "private")):
+            self.callback(SimpleNamespace(from_user=SimpleNamespace(id=1), chat=SimpleNamespace(id=chat, type=kind)))
+        self.assertEqual(self.requests, [-100, 1])
+
+    def test_disabled_relay_is_explained_without_forwarding(self):
+        self.relay = None
+        self.callback(SimpleNamespace(from_user=SimpleNamespace(id=1), chat=SimpleNamespace(id=1, type="private")))
+        self.assertIn("ещё не настроена", self.replies[-1])
+
+
+class SessionTests(TestCase):
+    def test_compaction_preserves_cookies_auth_and_unknown_databases(self):
+        state = {"cookies": [{"name": "auth", "value": "fake"}], "origins": [{
+            "origin": "https://vk.ru", "localStorage": [{"name": "web_token", "value": "fake"}],
+            "indexedDB": [{"name": "stickers-v1", "stores": []},
+                          {"name": "unknown-auth-db", "stores": [{"name": "s", "records": [{"key": "auth", "value": "fake"}]}]},
+                          {"name": "reforged-storage-db-v1", "stores": [{"name": "storage", "records": [
+                              {"key": "prefix-stickers-keywords", "value": "cache"},
+                              {"key": "auth", "value": "fake"}]}]}]}]}
+        original = json.dumps(state)
+        compact = compact_session(state)
+        self.assertEqual(json.dumps(state), original)
+        self.assertEqual(compact["cookies"], state["cookies"])
+        self.assertEqual(compact["origins"][0]["localStorage"], state["origins"][0]["localStorage"])
+        databases = compact["origins"][0]["indexedDB"]
+        self.assertEqual([db["name"] for db in databases], ["unknown-auth-db", "reforged-storage-db-v1"])
+        self.assertEqual(len(databases[-1]["stores"][0]["records"]), 1)
