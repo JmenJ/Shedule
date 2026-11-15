@@ -13,6 +13,7 @@ from database import Repository
 from handlers import BotHandlers
 from notifications import NotificationDispatcher
 from vk_relay.service import RelaySettings, VkRelay
+from vk_relay.commands import register_commands
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -26,7 +27,6 @@ repository.create_schema()
 
 bot = telebot.TeleBot(settings.bot_token, threaded=True)
 handlers = BotHandlers(bot, repository, settings)
-handlers.register()
 notification_dispatcher = NotificationDispatcher(bot, repository)
 vk_relay = None
 try:
@@ -35,6 +35,8 @@ try:
         vk_relay = VkRelay(bot, vk_settings)
 except Exception:
     LOGGER.error("VK relay configuration is invalid; schedule bot remains available")
+register_commands(bot, lambda: vk_relay, settings.owner_ids)
+handlers.register()
 
 app = Flask(__name__)
 
@@ -66,6 +68,7 @@ def configure_telegram() -> None:
         types.BotCommand("start", "открыть расписание"),
         types.BotCommand("help", "помощь с учётом ваших прав"),
         types.BotCommand("myid", "показать мой Telegram ID"),
+        types.BotCommand("vk_test", "тест последнего сообщения ВК"),
         types.BotCommand("settings", "настройки этой группы"),
         types.BotCommand("mods", "редакторы этой группы"),
         types.BotCommand("copy", "объединить чаты одним расписанием"),

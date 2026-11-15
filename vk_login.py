@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from playwright.async_api import async_playwright
 from vk_relay.messages import extract_messages, parse_payload, request_peer, source_link
 from vk_relay.service import HISTORY_METHOD
+from vk_relay.session import compact_session
 
 ROOT = Path(__file__).resolve().parent
 PEER = 2000000012
@@ -90,7 +91,8 @@ async def main():
         else:
             path = folder / "vk_auth.json"
             temp = path.with_suffix(".tmp")
-            await context.storage_state(path=str(temp), indexed_db=True)
+            state = compact_session(await context.storage_state(indexed_db=True))
+            temp.write_text(json.dumps(state, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
             os.replace(temp, path)
             print(f"Чтение нужной беседы подтверждено: распознано {len(found)} сообщений.")
             print("Сессия сохранена:", path)
